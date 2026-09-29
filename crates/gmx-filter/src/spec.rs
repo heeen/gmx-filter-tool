@@ -1,7 +1,7 @@
 //! Text specs for rule conditions and actions, and the assembly of a rule from them. The assembly
 //! mirrors the payload builder of the GMX web UI (`mailset-organize-inbox`).
 
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use crate::{
     Action, Comparator, Condition, Error, HeaderCondition, KnownAction, KnownCondition,
@@ -22,7 +22,10 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderField {
     From,
+    /// The recipient as the current web UI writes it (no `includeCcHeader`).
     To,
+    /// Recipient with `includeCcHeader: true`, as older rules carry it.
+    ToCc,
     Subject,
 }
 
@@ -89,7 +92,7 @@ impl FromStr for Test {
                     _ => return Err(invalid(spec, "low, normal or high")),
                 },
             }),
-            (Some(field @ ("from" | "to" | "subject")), Some(op), Some(value))
+            (Some(field @ ("from" | "to" | "to-cc" | "subject")), Some(op), Some(value))
                 if !value.is_empty() =>
             {
                 let (comparator, negated) = match op {
@@ -110,6 +113,7 @@ impl FromStr for Test {
                     field: match field {
                         "from" => HeaderField::From,
                         "to" => HeaderField::To,
+                        "to-cc" => HeaderField::ToCc,
                         _ => HeaderField::Subject,
                     },
                     comparator,
@@ -187,6 +191,264 @@ pub fn actions(effects: Vec<Effect>, stop: bool) -> Vec<Action> {
     actions
 }
 
+impl HeaderField {
+    fn keyword(self) -> &'static str {
+        match self {
+            HeaderField::From => "from",
+            HeaderField::To => "to",
+            HeaderField::ToCc => "to-cc",
+            HeaderField::Subject => "subject",
+        }
+    }
+}
+
+impl fmt::Display for Test {
+    /// The exact inverse of [`FromStr`] for every test it can produce.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Test::AllNewEmails => f.write_str("all-new"),
+            Test::Header {
+                field,
+                comparator,
+                negated,
+                value,
+            } => {
+                let op = match (comparator, negated) {
+                    (Comparator::Contains, false) => "contains",
+                    (Comparator::Contains, true) => "not-contains",
+                    (Comparator::Is, false) => "is",
+                    (Comparator::Is, true) => "is-not",
+                    (Comparator::StartsWith, false) => "starts-with",
+                    (Comparator::StartsWith, true) => "not-starts-with",
+                    (Comparator::EndsWith, false) => "ends-with",
+                    (Comparator::EndsWith, true) => "not-ends-with",
+                    (Comparator::Other(other), _) => other,
+                };
+                write!(f, "{} {op} {value}", field.keyword())
+            }
+            Test::Size { larger, bytes } => {
+                let (n, unit) = match bytes {
+                    b if *b > 0 && b % MB == 0 => (b / MB, "MB"),
+                    b if *b > 0 && b % KB == 0 => (b / KB, "KB"),
+                    b => (*b, "B"),
+                };
+                write!(f, "size {} {n}{unit}", if *larger { "gt" } else { "lt" })
+            }
+            Test::Priority { negated, level } => {
+                let level = match level {
+                    PriorityLevel::Low => "low",
+                    PriorityLevel::Normal => "normal",
+                    PriorityLevel::High => "high",
+                    PriorityLevel::Other(other) => other,
+                };
+                write!(
+                    f,
+                    "priority {} {level}",
+                    if *negated { "is-not" } else { "is" }
+                )
+            }
+            Test::Contact { saved } => {
+                write!(f, "contact {}", if *saved { "saved" } else { "not-saved" })
+            }
+        }
+    }
+}
+
+impl fmt::Display for Effect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Effect::Move(folder) => write!(f, "move {folder}"),
+            Effect::Copy(folder) => write!(f, "copy {folder}"),
+            Effect::MarkRead => f.write_str("read"),
+            Effect::Delete => f.write_str("delete"),
+            Effect::Forward(to) => write!(f, "forward {to}"),
+            Effect::Notify(to) => write!(f, "notify {to}"),
+        }
+    }
+}
+
+/// The condition rows of a rule, or `None` when the condition is not expressible as `--when` rows
+/// with certainty (nested groups, `AND` operators, inverted multi-value groups, unknown values).
+/// Structure may differ from what [`condition`] rebuilds (e.g. an `AnyOf` of single-value groups
+/// collapses), but the meaning does not.
+pub fn tests_of(c: &Condition) -> Option<(Mode, Vec<Test>)> {
+    let Condition::Known(known) = c else {
+        return None;
+    };
+    let (mode, rows) = match known {
+        KnownCondition::AllOf { conditions } => (
+            Mode::All,
+            conditions
+                .iter()
+                .map(single_row)
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        KnownCondition::AnyOf { conditions } => (
+            Mode::Any,
+            conditions
+                .iter()
+                .map(any_rows)
+                .collect::<Option<Vec<_>>>()?
+                .concat(),
+        ),
+        _ => (Mode::Any, any_rows(c)?),
+    };
+    let stable = |t: &Test| t.to_string().parse::<Test>().is_ok_and(|p| &p == t);
+    (!rows.is_empty() && rows.iter().all(stable)).then_some((mode, rows))
+}
+
+fn single_row(c: &Condition) -> Option<Test> {
+    let mut rows = any_rows(c)?;
+    (rows.len() == 1).then(|| rows.remove(0))
+}
+
+/// Rows that are alternatives of each other when the condition stands under an "any".
+fn any_rows(c: &Condition) -> Option<Vec<Test>> {
+    let Condition::Known(known) = c else {
+        return None;
+    };
+    let (field, operator, inverted, headers) = match known {
+        KnownCondition::AllNewEmails { inverted: false } => return Some(vec![Test::AllNewEmails]),
+        KnownCondition::SizeOver {
+            inverted,
+            byte_size,
+        } => {
+            return Some(vec![Test::Size {
+                larger: !inverted,
+                bytes: *byte_size,
+            }]);
+        }
+        KnownCondition::Priority { inverted, level } => {
+            return Some(vec![Test::Priority {
+                negated: *inverted,
+                level: level.clone(),
+            }]);
+        }
+        KnownCondition::AnyContact { inverted } => {
+            return Some(vec![Test::Contact { saved: !inverted }]);
+        }
+        KnownCondition::MultiFromComparator {
+            operator,
+            inverted,
+            header_comparator_conditions,
+        } => (
+            HeaderField::From,
+            operator,
+            *inverted,
+            header_comparator_conditions,
+        ),
+        KnownCondition::MultiToComparator {
+            operator,
+            inverted,
+            header_comparator_conditions,
+        } => (
+            HeaderField::To,
+            operator,
+            *inverted,
+            header_comparator_conditions,
+        ),
+        KnownCondition::MultiSubjectComparator {
+            operator,
+            inverted,
+            header_comparator_conditions,
+        } => (
+            HeaderField::Subject,
+            operator,
+            *inverted,
+            header_comparator_conditions,
+        ),
+        _ => return None,
+    };
+    if *operator != Operator::Or || headers.is_empty() || (inverted && headers.len() != 1) {
+        return None;
+    }
+    headers
+        .iter()
+        .map(|h| header_test(field, inverted, h))
+        .collect()
+}
+
+fn header_test(group: HeaderField, negated: bool, h: &HeaderCondition) -> Option<Test> {
+    let HeaderCondition::Known(known) = h else {
+        return None;
+    };
+    let (field, comparator, inverted, value) = match known {
+        KnownHeaderCondition::From {
+            comparator,
+            inverted,
+            value,
+        } => (HeaderField::From, comparator, inverted, value),
+        KnownHeaderCondition::Subject {
+            comparator,
+            inverted,
+            value,
+        } => (HeaderField::Subject, comparator, inverted, value),
+        KnownHeaderCondition::ToCc {
+            comparator,
+            inverted,
+            include_cc_header,
+            value,
+        } => {
+            let field = match include_cc_header {
+                None => HeaderField::To,
+                Some(true) => HeaderField::ToCc,
+                Some(false) => return None,
+            };
+            (field, comparator, inverted, value)
+        }
+    };
+    let group_matches = matches!(
+        (group, field),
+        (HeaderField::To, HeaderField::To | HeaderField::ToCc)
+            | (HeaderField::From, HeaderField::From)
+            | (HeaderField::Subject, HeaderField::Subject)
+    );
+    (group_matches && !inverted && !matches!(comparator, Comparator::Other(_))).then(|| {
+        Test::Header {
+            field,
+            comparator: comparator.clone(),
+            negated,
+            value: value.clone(),
+        }
+    })
+}
+
+/// The effects of an action list and whether it ends in `Stop`, or `None` for anything the
+/// `--then` syntax cannot express (legacy types, several receivers, `Stop` in the middle).
+pub fn effects_of(actions: &[Action]) -> Option<(Vec<Effect>, bool)> {
+    let (body, stop) = match actions.split_last() {
+        Some((Action::Known(KnownAction::Stop), body)) => (body, true),
+        _ => (actions, false),
+    };
+    let effects = body
+        .iter()
+        .map(|a| match a {
+            Action::Known(KnownAction::MoveToFolder { folder }) => {
+                Some(Effect::Move(folder.clone()))
+            }
+            Action::Known(KnownAction::CopyToFolder { folder }) => {
+                Some(Effect::Copy(folder.clone()))
+            }
+            Action::Known(KnownAction::MarkSeen) => Some(Effect::MarkRead),
+            Action::Known(KnownAction::DeleteMailImmediately) => Some(Effect::Delete),
+            Action::Known(KnownAction::CopyForward { receivers, .. }) => match receivers.as_slice()
+            {
+                [one] => Some(Effect::Forward(one.clone())),
+                _ => None,
+            },
+            Action::Known(KnownAction::TemplatedEmailNotify { pagers, .. }) => {
+                match pagers.as_slice() {
+                    [one] => Some(Effect::Notify(one.clone())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let stable = |e: &Effect| e.to_string().parse::<Effect>().is_ok_and(|p| &p == e);
+    (!effects.is_empty() && effects.iter().all(stable)).then_some((effects, stop))
+}
+
 fn row(test: &Test) -> Condition {
     Condition::Known(match test {
         Test::AllNewEmails => KnownCondition::AllNewEmails { inverted: false },
@@ -219,10 +481,10 @@ fn header_condition(field: HeaderField, comparator: &Comparator, value: &str) ->
             inverted,
             value,
         },
-        HeaderField::To => KnownHeaderCondition::ToCc {
+        HeaderField::To | HeaderField::ToCc => KnownHeaderCondition::ToCc {
             comparator,
             inverted,
-            include_cc_header: None,
+            include_cc_header: (field == HeaderField::ToCc).then_some(true),
             value,
         },
         HeaderField::Subject => KnownHeaderCondition::Subject {
@@ -245,7 +507,7 @@ fn multi(
             inverted,
             header_comparator_conditions,
         },
-        HeaderField::To => KnownCondition::MultiToComparator {
+        HeaderField::To | HeaderField::ToCc => KnownCondition::MultiToComparator {
             operator,
             inverted,
             header_comparator_conditions,
@@ -437,5 +699,164 @@ mod tests {
             json!([{"type": "CopyForward", "pending": true, "receivers": ["a@b.de"]},
                    {"type": "MarkSeen"}, {"type": "Stop"}])
         );
+    }
+
+    fn cond(v: serde_json::Value) -> Condition {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn display_is_the_inverse_of_parse() {
+        for spec in [
+            "all-new",
+            "from contains a@b",
+            "to-cc not-contains x y",
+            "subject is-not Re: hi",
+            "subject starts-with [x]",
+            "to ends-with @gmx.de",
+            "size gt 5MB",
+            "size lt 3KB",
+            "size gt 1500B",
+            "priority is-not high",
+            "contact not-saved",
+        ] {
+            assert_eq!(test(spec).to_string(), spec);
+        }
+        for spec in [
+            "move INBOX/A B",
+            "copy X",
+            "read",
+            "delete",
+            "forward a@b.de",
+            "notify a@b.de",
+        ] {
+            assert_eq!(spec.parse::<Effect>().unwrap().to_string(), spec);
+        }
+    }
+
+    #[test]
+    fn built_conditions_read_back_to_the_same_tests() {
+        let sets: Vec<(Mode, Vec<&str>)> = vec![
+            (Mode::Any, vec!["from contains a"]),
+            (Mode::Any, vec!["from contains a", "from is b"]),
+            (
+                Mode::Any,
+                vec!["from contains a", "subject contains b", "size gt 1MB"],
+            ),
+            (Mode::Any, vec!["to contains a", "to-cc contains b"]),
+            (Mode::Any, vec!["subject not-contains promo"]),
+            (Mode::Any, vec!["all-new"]),
+            (
+                Mode::All,
+                vec!["from contains a", "priority is high", "contact saved"],
+            ),
+            (Mode::All, vec!["size lt 1MB", "subject is-not x"]),
+        ];
+        for (mode, specs) in sets {
+            let tests: Vec<Test> = specs.iter().map(|s| test(s)).collect();
+            let built = condition(mode, &tests).unwrap();
+            let (m, back) = tests_of(&built).unwrap_or_else(|| panic!("{specs:?}"));
+            assert_eq!(back, tests, "{specs:?}");
+            if tests.len() > 1 {
+                assert_eq!(m, mode, "{specs:?}");
+            }
+            assert_eq!(condition(m, &back).unwrap(), built, "{specs:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_and_hand_written_shapes() {
+        // older rules: value under `from`, `to` with includeCcHeader, groups of several values
+        let legacy = cond(
+            json!({"type": "MultiToComparator", "operator": "OR", "inverted": false,
+            "headerComparatorConditions": [
+                {"type": "ToCc", "comparator": "CONTAINS", "inverted": false, "includeCcHeader": true, "to": "a@b"},
+                {"type": "ToCc", "comparator": "CONTAINS", "inverted": false, "includeCcHeader": true, "to": "c@d"}]}),
+        );
+        let (mode, rows) = tests_of(&legacy).unwrap();
+        assert_eq!(mode, Mode::Any);
+        assert_eq!(
+            rows,
+            [test("to-cc contains a@b"), test("to-cc contains c@d")]
+        );
+        // an AnyOf of groups flattens into rows
+        let any_of = cond(json!({"type": "AnyOf", "conditions": [
+            {"type": "MultiFromComparator", "operator": "OR", "inverted": false, "headerComparatorConditions": [
+                {"type": "From", "comparator": "CONTAINS", "inverted": false, "from": "x"},
+                {"type": "From", "comparator": "CONTAINS", "inverted": false, "from": "y"}]},
+            {"type": "MultiSubjectComparator", "operator": "OR", "inverted": false, "headerComparatorConditions": [
+                {"type": "Subject", "comparator": "CONTAINS", "inverted": false, "subject": "z"}]}]}));
+        assert_eq!(tests_of(&any_of).unwrap().1.len(), 3);
+    }
+
+    #[test]
+    fn inexpressible_conditions_fall_back_to_raw() {
+        let group = |extra: serde_json::Value| {
+            let mut v = json!({"type": "MultiFromComparator", "operator": "OR", "inverted": false,
+                "headerComparatorConditions": [
+                    {"type": "From", "comparator": "CONTAINS", "inverted": false, "comparand": "a"},
+                    {"type": "From", "comparator": "CONTAINS", "inverted": false, "comparand": "b"}]});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            cond(v)
+        };
+        assert!(tests_of(&group(json!({}))).is_some());
+        assert!(
+            tests_of(&group(json!({"inverted": true}))).is_none(),
+            "NOT (a OR b) has no row form"
+        );
+        assert!(tests_of(&group(json!({"operator": "AND"}))).is_none());
+        assert!(tests_of(&cond(json!({"type": "Weird"}))).is_none());
+        let unknown_cmp = cond(
+            json!({"type": "MultiFromComparator", "operator": "OR", "inverted": false,
+            "headerComparatorConditions": [{"type": "From", "comparator": "MATCHES", "inverted": false, "comparand": "a"}]}),
+        );
+        assert!(tests_of(&unknown_cmp).is_none());
+        let padded = cond(
+            json!({"type": "MultiFromComparator", "operator": "OR", "inverted": false,
+            "headerComparatorConditions": [{"type": "From", "comparator": "CONTAINS", "inverted": false, "comparand": " a "}]}),
+        );
+        assert!(
+            tests_of(&padded).is_none(),
+            "surrounding blanks would not survive the spec syntax"
+        );
+        let no_cc = cond(
+            json!({"type": "MultiToComparator", "operator": "OR", "inverted": false,
+            "headerComparatorConditions": [{"type": "ToCc", "comparator": "CONTAINS", "inverted": false, "includeCcHeader": false, "comparand": "a"}]}),
+        );
+        assert!(tests_of(&no_cc).is_none());
+        let nested = cond(
+            json!({"type": "AllOf", "conditions": [group(json!({})), {"type": "AllNewEmails", "inverted": false}]}),
+        );
+        assert!(tests_of(&nested).is_none());
+    }
+
+    #[test]
+    fn effects_read_back_and_legacy_falls_back() {
+        let effects = vec![
+            Effect::Copy("INBOX/A".into()),
+            Effect::MarkRead,
+            Effect::Notify("a@b.de".into()),
+        ];
+        for stop in [true, false] {
+            assert_eq!(
+                effects_of(&actions(effects.clone(), stop)),
+                Some((effects.clone(), stop))
+            );
+        }
+        let legacy: Vec<Action> =
+            serde_json::from_value(json!([{"type": "ExcludeFromSpamFilter"}, {"type": "Stop"}]))
+                .unwrap();
+        assert_eq!(effects_of(&legacy), None);
+        let two: Vec<Action> = serde_json::from_value(
+            json!([{"type": "CopyForward", "pending": false, "receivers": ["a", "b"]}]),
+        )
+        .unwrap();
+        assert_eq!(effects_of(&two), None);
+        let mid_stop: Vec<Action> =
+            serde_json::from_value(json!([{"type": "Stop"}, {"type": "MarkSeen"}])).unwrap();
+        assert_eq!(effects_of(&mid_stop), None);
+        assert_eq!(effects_of(&[]), None);
     }
 }
