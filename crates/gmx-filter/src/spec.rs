@@ -402,10 +402,10 @@ fn header_test(group: HeaderField, negated: bool, h: &HeaderCondition) -> Option
             include_cc_header,
             value,
         } => {
+            // the server stores an absent flag as `false`, so the two are the same rule
             let field = match include_cc_header {
-                None => HeaderField::To,
                 Some(true) => HeaderField::ToCc,
-                Some(false) => return None,
+                Some(false) | None => HeaderField::To,
             };
             (field, comparator, inverted, value)
         }
@@ -834,11 +834,15 @@ mod tests {
             tests_of(&padded).is_none(),
             "surrounding blanks would not survive the spec syntax"
         );
-        let no_cc = cond(
+        let explicit_false = cond(
             json!({"type": "MultiToComparator", "operator": "OR", "inverted": false,
             "headerComparatorConditions": [{"type": "ToCc", "comparator": "CONTAINS", "inverted": false, "includeCcHeader": false, "comparand": "a"}]}),
         );
-        assert!(tests_of(&no_cc).is_none());
+        assert_eq!(
+            tests_of(&explicit_false).unwrap().1,
+            [test("to contains a")],
+            "an explicit false is what the server stores for a plain `to`"
+        );
         let nested = cond(
             json!({"type": "AllOf", "conditions": [group(json!({})), {"type": "AllNewEmails", "inverted": false}]}),
         );

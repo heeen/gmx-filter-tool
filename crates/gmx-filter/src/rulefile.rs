@@ -215,6 +215,11 @@ fn keep_confirmation(action: &Action, existing: &[Action]) -> Action {
     })
 }
 
+/// Compact JSON with sorted keys, so equal values compare equal however they were produced.
+fn canonical_json(value: &impl Serialize) -> Option<String> {
+    serde_json::to_value(value).ok().map(|v| v.to_string())
+}
+
 fn compact(json: &str) -> std::result::Result<String, serde_json::Error> {
     serde_json::from_str::<Value>(json).map(|v| v.to_string())
 }
@@ -227,11 +232,7 @@ fn entry_of(rule: &Rule) -> RuleEntry {
             tests.iter().map(Test::to_string).collect(),
             None,
         ),
-        None => (
-            MatchMode::Any,
-            Vec::new(),
-            serde_json::to_string(&rule.condition).ok(),
-        ),
+        None => (MatchMode::Any, Vec::new(), canonical_json(&rule.condition)),
     };
     let (then, stop, actions_json) = match effects_of(&rule.actions) {
         Some((effects, stop)) => (
@@ -239,7 +240,7 @@ fn entry_of(rule: &Rule) -> RuleEntry {
             Some(stop),
             None,
         ),
-        None => (Vec::new(), None, serde_json::to_string(&rule.actions).ok()),
+        None => (Vec::new(), None, canonical_json(&rule.actions)),
     };
     RuleEntry {
         id: rule.rule_id.clone(),
@@ -503,6 +504,14 @@ pub(crate) mod tests {
             {"type": TYPE, "ruleId": "9", "ruleName": "odd", "active": true, "considerStopped": true,
              "condition": {"type": "Brand new", "x": [1, 2]},
              "actions": [{"type": "ExcludeFromSpamFilter"}, {"type": "Stop"}]},
+            {"type": TYPE, "ruleId": "11", "ruleName": "not-either", "active": true, "considerStopped": true,
+             "condition": {"type": "MultiFromComparator", "operator": "OR", "inverted": true, "headerComparatorConditions": [
+                 {"type": "From", "comparator": "CONTAINS", "inverted": false, "comparand": "a"},
+                 {"type": "From", "comparator": "CONTAINS", "inverted": false, "comparand": "b"}]},
+             "actions": [{"type": "MarkSeen"}]},
+            {"type": TYPE, "ruleId": "12", "ruleName": "explicit-false", "active": true, "considerStopped": true,
+             "condition": multi("MultiToComparator", vec![json!({"type": "ToCc", "comparator": "CONTAINS", "inverted": false, "includeCcHeader": false, "comparand": "x@y.de"})]),
+             "actions": [{"type": "MarkSeen"}]},
             {"type": TYPE, "ruleId": "10", "ruleName": "fwd", "active": true, "considerStopped": true,
              "condition": multi("MultiToComparator", vec![header("ToCc", "CONTAINS", "comparand", "me@gmx.de")]),
              "actions": [{"type": "CopyForward", "pending": false, "receivers": ["a@b.de"]},
@@ -546,9 +555,13 @@ pub(crate) mod tests {
         assert!(text.contains("# not expressible as when/then"));
         assert!(text.contains("condition_json = '''"));
         let d = parse(&text).unwrap();
-        let rebuilt = d[0].to_rule(Some(&set[0]));
-        assert_eq!(rebuilt.condition, set[0].condition);
-        assert_eq!(rebuilt.actions, set[0].actions);
+        for i in [0, 1] {
+            let rebuilt = d[i].to_rule(Some(&set[i]));
+            assert_eq!(rebuilt.condition, set[i].condition);
+            assert_eq!(rebuilt.actions, set[i].actions);
+        }
+        // a plain `to` written by the server with an explicit `includeCcHeader: false` stays readable
+        assert!(text.contains("\"to contains x@y.de\""));
     }
 
     #[test]
@@ -566,9 +579,9 @@ pub(crate) mod tests {
             .replace("name = \"fwd\"", "name = \"forwarder\"")
             .replace("me@gmx.de", "you@gmx.de");
         let d = parse(&text).unwrap();
-        let fields: Vec<_> = d[1].changes(&set[1]).into_iter().map(|c| c.0).collect();
+        let fields: Vec<_> = d[3].changes(&set[3]).into_iter().map(|c| c.0).collect();
         assert_eq!(fields, ["name", "when"]);
-        let rule = d[1].to_rule(Some(&set[1]));
+        let rule = d[3].to_rule(Some(&set[3]));
         assert_eq!(rule.rule_name, "forwarder");
         assert_eq!(rule.rule_id.as_deref(), Some("10"));
         // unchanged targets keep their state; new ones get the web UI defaults
@@ -581,7 +594,7 @@ pub(crate) mod tests {
             Action::Known(KnownAction::TemplatedEmailNotify { pending: true, .. })
         )));
         let edited = text.replace("forward a@b.de", "forward new@b.de");
-        let rule = parse(&edited).unwrap()[1].to_rule(Some(&set[1]));
+        let rule = parse(&edited).unwrap()[3].to_rule(Some(&set[3]));
         assert!(rule.actions.iter().any(|a| matches!(a, Action::Known(KnownAction::CopyForward { pending: true, receivers }) if receivers == &["new@b.de"])));
     }
 
