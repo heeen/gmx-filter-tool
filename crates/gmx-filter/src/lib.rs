@@ -1,5 +1,6 @@
 mod client;
 mod error;
+mod lint;
 mod login;
 mod model;
 mod plan;
@@ -11,6 +12,7 @@ mod token;
 
 pub use client::{Client, Folder};
 pub use error::{Error, Result};
+pub use lint::{Diagnostic, Severity, check, has_errors};
 pub use model::*;
 pub use plan::{Op, Plan};
 pub use rulefile::{DesiredRule, export, parse};
