@@ -1,0 +1,8 @@
+/target/
+/re/raw/
+*.har
+*.apk
+*.xapk
+re/apk/
+re/gmx-src/
+.playwright-mcp/
