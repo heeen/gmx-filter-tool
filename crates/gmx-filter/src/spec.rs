@@ -533,6 +533,33 @@ fn multi(
     }
 }
 
+/// `condition` with `extra` rows added, for widening a rule. `Ok(None)` when every row is already
+/// there. Refuses conditions that are not plain "any of these rows": adding to an "all of" rule
+/// would narrow it, and raw conditions cannot be edited safely.
+pub fn extend_condition(current: &Condition, extra: &[Test]) -> Result<Option<Condition>> {
+    let Some((mode, mut tests)) = tests_of(current) else {
+        return Err(Error::InvalidSpec(
+            "this rule's condition cannot be edited as rows; use `gmxf edit`".into(),
+        ));
+    };
+    if mode == Mode::All {
+        return Err(Error::InvalidSpec(
+            "this rule needs all of its conditions, so adding one would narrow it; use `gmxf edit`"
+                .into(),
+        ));
+    }
+    let before = tests.len();
+    for t in extra {
+        if !tests.contains(t) {
+            tests.push(t.clone());
+        }
+    }
+    if tests.len() == before {
+        return Ok(None);
+    }
+    condition(Mode::Any, &tests).map(Some)
+}
+
 /// Builds the condition tree the way the web UI does: one row stands alone, `All` becomes
 /// `AllOf`, and `Any` over plain (non-negated) rows of one header field collapses into a single
 /// multi-comparator.
@@ -875,5 +902,64 @@ mod tests {
             serde_json::from_value(json!([{"type": "Stop"}, {"type": "MarkSeen"}])).unwrap();
         assert_eq!(effects_of(&mid_stop), None);
         assert_eq!(effects_of(&[]), None);
+    }
+
+    #[test]
+    fn extending_adds_new_rows_and_skips_known_ones() {
+        let base = condition(
+            Mode::Any,
+            &[test("from contains a"), test("from contains b")],
+        )
+        .unwrap();
+        let wider = extend_condition(
+            &base,
+            &[
+                test("from contains b"),
+                test("from contains c"),
+                test("subject contains s"),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        let (mode, rows) = tests_of(&wider).unwrap();
+        assert_eq!(mode, Mode::Any);
+        assert_eq!(
+            rows,
+            [
+                test("from contains a"),
+                test("from contains b"),
+                test("from contains c"),
+                test("subject contains s")
+            ]
+        );
+        assert_eq!(
+            extend_condition(&base, &[test("from contains a")]).unwrap(),
+            None
+        );
+        // a single-row rule becomes a group
+        let one = condition(Mode::Any, &[test("from contains a")]).unwrap();
+        assert_eq!(
+            tests_of(
+                &extend_condition(&one, &[test("from contains z")])
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+            .1
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn extending_refuses_what_it_cannot_widen_safely() {
+        let all = condition(Mode::All, &[test("from contains a"), test("size gt 1MB")]).unwrap();
+        assert!(
+            extend_condition(&all, &[test("from contains z")])
+                .unwrap_err()
+                .to_string()
+                .contains("narrow")
+        );
+        assert!(extend_condition(&cond(json!({"type": "Weird"})), &[test("all-new")]).is_err());
     }
 }

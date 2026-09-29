@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use gmx_filter::{
     Action, Client, CommandTokenSource, Condition, Effect, HeaderCondition, KnownAction,
     KnownCondition, KnownHeaderCondition, Mode, Rule, Test, TokenSource, actions, condition,
-    export, login, logout, rule_notes, stored_token_source,
+    export, extend_condition, login, logout, rule_notes, stored_token_source,
 };
 use secrecy::SecretString;
 
@@ -107,6 +107,22 @@ enum ApiCommand {
         #[arg(long)]
         no_stop: bool,
     },
+    /// Widen a rule: add addresses or patterns as extra conditions (any of them matches).
+    ///
+    /// VALUES become `from contains <value>` rows (`--field` picks another header); `--when` adds
+    /// arbitrary condition rows. Rows the rule already has are skipped.
+    Extend {
+        /// Rule id or exact name (case-insensitive).
+        rule: String,
+        values: Vec<String>,
+        #[arg(long, default_value = "from", value_parser = ["from", "to", "to-cc", "subject"])]
+        field: String,
+        #[arg(long = "when")]
+        tests: Vec<Test>,
+        /// Show the change without saving it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Move a rule to a 1-based position in the rule order.
     Move {
         rule_id: String,
@@ -172,6 +188,21 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Api(cmd) => run_api(cmd, &connect(cli.token_cmd)?),
+    }
+}
+
+/// A rule by id, else by exact name (case-insensitive) if that is unambiguous.
+fn find_rule<'a>(rules: &'a [Rule], key: &str) -> Result<&'a Rule> {
+    if let Some(r) = rules.iter().find(|r| r.rule_id.as_deref() == Some(key)) {
+        return Ok(r);
+    }
+    let mut named = rules
+        .iter()
+        .filter(|r| r.rule_name.eq_ignore_ascii_case(key));
+    match (named.next(), named.next()) {
+        (Some(r), None) => Ok(r),
+        (None, _) => bail!("no rule with id or name {key:?}"),
+        (Some(_), Some(_)) => bail!("several rules are named {key:?}; use the id from `gmxf list`"),
     }
 }
 
@@ -254,6 +285,32 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
             let rule = Rule::new(&name, condition(mode, &tests)?, actions(effects, !no_stop));
             client.create_rule(&rule)?;
             println!("created {name}");
+        }
+        ApiCommand::Extend {
+            rule,
+            values,
+            field,
+            mut tests,
+            dry_run,
+        } => {
+            for v in values {
+                tests.push(format!("{field} contains {v}").parse()?);
+            }
+            if tests.is_empty() {
+                bail!("nothing to add: give values or --when");
+            }
+            let rules = client.list_rules()?;
+            let mut target = find_rule(&rules, &rule)?.clone();
+            let Some(wider) = extend_condition(&target.condition, &tests)? else {
+                println!("{:?} already has all of these", target.rule_name);
+                return Ok(());
+            };
+            let added: Vec<String> = tests.iter().map(ToString::to_string).collect();
+            println!("{:?} += {}", target.rule_name, added.join(", "));
+            if !dry_run {
+                target.condition = wider;
+                client.update_rule(&target)?;
+            }
         }
         ApiCommand::Move { rule_id, position } => {
             let mut rules = client.list_rules()?;
