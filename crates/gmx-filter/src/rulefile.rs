@@ -97,6 +97,28 @@ pub struct DesiredRule {
 }
 
 impl DesiredRule {
+    /// One line for previews: the conditions and actions in file syntax.
+    pub fn summary(&self) -> String {
+        let c = &self.canon;
+        let when = if c.when.is_empty() {
+            "raw condition".to_owned()
+        } else {
+            let sep = if c.mode == MatchMode::All {
+                " AND "
+            } else {
+                " OR "
+            };
+            c.when.join(sep)
+        };
+        let then = if c.then.is_empty() {
+            "raw actions".to_owned()
+        } else {
+            let stop = if c.stop == Some(false) { "" } else { ", stop" };
+            format!("{}{stop}", c.then.join(", "))
+        };
+        format!("if {when} -> {then}")
+    }
+
     /// True when the server rule already says the same, however the file spells it.
     pub fn same_as(&self, remote: &Rule) -> bool {
         let mut theirs = entry_of(remote);
@@ -427,12 +449,12 @@ fn build(entry: RuleEntry) -> std::result::Result<DesiredRule, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
 
-    fn rules(v: Value) -> Vec<Rule> {
+    pub(crate) fn rules(v: Value) -> Vec<Rule> {
         serde_json::from_value(v).unwrap()
     }
 
@@ -448,7 +470,7 @@ mod tests {
 
     /// The shapes found on a real account: legacy numeric ids, values under from/to/subject,
     /// `includeCcHeader`, a group of many values, an `AnyOf` of groups, a plain new-style rule.
-    fn fixtures() -> Vec<Rule> {
+    pub(crate) fn fixtures() -> Vec<Rule> {
         let mv =
             |folder: &str| json!([{"type": "MoveToFolder", "folder": folder}, {"type": "Stop"}]);
         rules(json!([

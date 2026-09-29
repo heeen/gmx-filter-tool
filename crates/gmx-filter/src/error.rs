@@ -30,6 +30,10 @@ pub enum Error {
         url: String,
         body: String,
     },
+    #[error("cannot apply: {0}")]
+    Plan(String),
+    #[error("applied, but the server does not match the file yet:\n{0}")]
+    Drift(String),
     #[error("rules file: {0}")]
     RuleFile(String),
     #[error("invalid rule spec: {0}")]
