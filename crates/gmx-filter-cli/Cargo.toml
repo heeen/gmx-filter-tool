@@ -1,0 +1,17 @@
+[package]
+name = "gmx-filter-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+gmx-filter = { version = "0.1.0", path = "../gmx-filter" }
+rpassword = "7.5.4"
+secrecy = "0.10.3"
+serde_json = "1.0.151"
+
+[[bin]]
+name = "gmxf"
+path = "src/main.rs"
