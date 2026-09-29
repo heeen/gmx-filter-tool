@@ -64,7 +64,16 @@ Extra condition types: `AllNewEmails{inverted}`, `AllOf{conditions}`, `SizeOver{
 (sender is in the address book; inverted = is not); `operator` may be `OR` or `AND`.
 Comparators: `CONTAINS`, `IS`, `STARTS_WITH`, `ENDS_WITH` (UI offers contains / not contains / is / is not;
 negation is the outer `inverted` of the Multi* condition, the inner one stays false).
-Header condition `type` also accepts `To` on read. The UI writes `ToCc` without `includeCcHeader`.
+Header condition `type` also accepts `To` on read. The UI writes `ToCc` without `includeCcHeader`; the server
+stores that as `includeCcHeader: false` (seen live), while rules made by older UIs carry `true`. gmxf's spec
+language therefore has `to` (absent/false) and `to-cc` (true).
+
+### Rules file, apply semantics (verified live)
+
+`PUT /filterRules/{id}` with the full rule updates name, condition and actions; activation only through
+`.../activate|deactivate`. Reorder always sends every rule (`PUT /filterRules {"rules": [...]}`); a partial list
+was deliberately never tried, as the server might drop the omitted rules. Creating answers 204 without the id, so
+`apply` re-lists and finds the new rule by its (unique) name.
 
 Actions: `MoveToFolder{folder}`, `CopyToFolder{folder}`, `MarkSeen`, `DeleteMailImmediately`,
 `CopyForward{pending: true, receivers[]}` (target must confirm by mail), `TemplatedEmailNotify{pending: false, pagers[]}`,

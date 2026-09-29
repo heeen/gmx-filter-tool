@@ -323,7 +323,17 @@ fn reorder(
         wanted
             .into_iter()
             .map(|k| match k {
-                Key::Remote(i) => (remote[i].rule_id.clone(), remote[i].rule_name.clone()),
+                Key::Remote(i) => {
+                    // show the name the rule will have after this plan
+                    let renamed = matched
+                        .iter()
+                        .position(|m| *m == Some(i))
+                        .map(|d| desired[d].name.clone());
+                    (
+                        remote[i].rule_id.clone(),
+                        renamed.unwrap_or_else(|| remote[i].rule_name.clone()),
+                    )
+                }
                 Key::New(d) => (None, desired[d].name.clone()),
             })
             .collect(),
@@ -440,6 +450,21 @@ mod tests {
             ["club-2", "new", "club köln"]
         );
         assert!(matches!(&middle.ops[1], Op::Reorder { order } if order[1].0.is_none()));
+    }
+
+    #[test]
+    fn the_reorder_preview_uses_the_new_names() {
+        let remote = fixtures();
+        let mut b = blocks(&export(&remote));
+        b.swap(0, 1);
+        let text = b
+            .join("\n")
+            .replace("name = \"chatter\"", "name = \"social\"");
+        let names = order_names(&plan(&remote, &text, false).unwrap());
+        assert!(
+            names.contains(&"social".to_owned()) && !names.contains(&"chatter".to_owned()),
+            "{names:?}"
+        );
     }
 
     #[test]
