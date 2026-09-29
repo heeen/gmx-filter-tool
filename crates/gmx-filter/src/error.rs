@@ -30,6 +30,8 @@ pub enum Error {
         url: String,
         body: String,
     },
+    #[error("rules file: {0}")]
+    RuleFile(String),
     #[error("invalid rule spec: {0}")]
     InvalidSpec(String),
     #[error("rule has no ruleId; use a rule returned by list_rules")]

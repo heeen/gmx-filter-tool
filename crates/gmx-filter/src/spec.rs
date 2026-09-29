@@ -73,8 +73,12 @@ impl FromStr for Test {
     /// `all-new`, `<from|to|subject> <contains|not-contains|is|is-not|starts-with|ends-with> <text>`,
     /// `size <gt|lt> <n>[B|KB|MB]`, `priority <is|is-not> <low|normal|high>`, `contact <saved|not-saved>`.
     fn from_str(spec: &str) -> Result<Self> {
-        let mut words = spec.trim().splitn(3, char::is_whitespace);
-        let (field, op, value) = (words.next(), words.next(), words.next().map(str::trim));
+        let (field, rest) = split_word(spec);
+        let (op, value) = rest.map_or((None, None), |r| {
+            let (op, value) = split_word(r);
+            (Some(op), value.filter(|v| !v.is_empty()))
+        });
+        let field = Some(field).filter(|f| !f.is_empty());
         match (field, op, value) {
             (Some("all-new"), None, None) => Ok(Test::AllNewEmails),
             (Some("contact"), Some("saved"), None) => Ok(Test::Contact { saved: true }),
@@ -126,6 +130,15 @@ impl FromStr for Test {
                 "`all-new`, `from|to|subject <op> <text>`, `size gt|lt <size>`, `priority is|is-not <level>` or `contact saved|not-saved`",
             )),
         }
+    }
+}
+
+/// The first whitespace-delimited word and the trimmed remainder, if any.
+fn split_word(s: &str) -> (&str, Option<&str>) {
+    let s = s.trim();
+    match s.split_once(char::is_whitespace) {
+        Some((word, rest)) => (word, Some(rest.trim_start())),
+        None => (s, None),
     }
 }
 
