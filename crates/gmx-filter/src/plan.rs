@@ -40,6 +40,8 @@ pub enum Op {
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     pub ops: Vec<Op>,
+    /// Server rules the file does not mention (left alone, or deleted when pruning).
+    pub unlisted: usize,
 }
 
 fn plan_err(msg: String) -> Error {
@@ -172,7 +174,8 @@ impl Plan {
         if let Some(order) = reorder(remote, desired, &matched, &taken, prune) {
             ops.push(Op::Reorder { order });
         }
-        Ok(Plan { ops })
+        let unlisted = taken.iter().filter(|t| !**t).count();
+        Ok(Plan { ops, unlisted })
     }
 
     /// Human-readable list of the operations.

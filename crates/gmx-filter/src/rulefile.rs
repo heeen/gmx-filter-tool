@@ -255,7 +255,7 @@ fn entry_of(rule: &Rule) -> RuleEntry {
 }
 
 /// Why the web UI will not let you edit a rule, or which state deserves a look.
-fn notes_of(rule: &Rule) -> Vec<&'static str> {
+pub fn rule_notes(rule: &Rule) -> Vec<&'static str> {
     let mut notes = Vec::new();
     let has_recipient = matches!(
         &rule.condition,
@@ -328,7 +328,7 @@ pub fn export(rules: &[Rule]) -> String {
     for rule in rules {
         let entry = entry_of(rule);
         out.push('\n');
-        for note in notes_of(rule) {
+        for note in rule_notes(rule) {
             let _ = writeln!(out, "# {note}");
         }
         if entry.condition_json.is_some() || entry.actions_json.is_some() {

@@ -15,7 +15,7 @@ pub use error::{Error, Result};
 pub use lint::{Diagnostic, Severity, check, has_errors};
 pub use model::*;
 pub use plan::{Op, Plan};
-pub use rulefile::{DesiredRule, export, parse};
+pub use rulefile::{DesiredRule, export, parse, rule_notes};
 pub use session::{login, logout, stored_token_source};
 pub use spec::{Effect, HeaderField, Mode, Test, actions, condition, effects_of, tests_of};
 pub use token::{CommandTokenSource, TokenSource};

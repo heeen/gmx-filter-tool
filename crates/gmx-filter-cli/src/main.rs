@@ -4,12 +4,14 @@ use std::{
     path::PathBuf,
 };
 
+mod rules_file;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gmx_filter::{
     Action, Client, CommandTokenSource, Condition, Effect, HeaderCondition, KnownAction,
-    KnownCondition, KnownHeaderCondition, Mode, Rule, Test, TokenSource, actions, condition, login,
-    logout, stored_token_source,
+    KnownCondition, KnownHeaderCondition, Mode, Rule, Test, TokenSource, actions, condition,
+    export, login, logout, rule_notes, stored_token_source,
 };
 use secrecy::SecretString;
 
@@ -37,6 +39,13 @@ enum Command {
     },
     /// Remove the stored session and config.
     Logout,
+    /// Check a rules file for syntax errors and suspicious rules (add --online to check folders).
+    Check {
+        file: PathBuf,
+        /// Also compare against the server: unknown folders, new forward targets.
+        #[arg(long)]
+        online: bool,
+    },
     #[command(flatten)]
     Api(ApiCommand),
 }
@@ -45,11 +54,38 @@ enum Command {
 enum ApiCommand {
     /// List rules.
     List,
-    /// Print all rules as JSON.
-    Export,
-    /// Create the rules from a JSON file produced by `export`.
-    Import {
+    /// Write all rules as an editable TOML file (stdout without FILE).
+    Export {
+        file: Option<PathBuf>,
+        /// Print the raw API JSON instead (a backup, not meant for editing).
+        #[arg(long, conflicts_with = "file")]
+        raw: bool,
+        /// Overwrite FILE if it exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Make the server match a rules file; shows the plan first.
+    ///
+    /// Rules are matched by `id`, else by name. Server rules missing from the file are left alone
+    /// unless --prune. Exit status 2 with --dry-run means there are changes.
+    Apply {
         file: PathBuf,
+        /// Only show what would change.
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete server rules that are not in the file.
+        #[arg(long)]
+        prune: bool,
+        /// Do not ask for confirmation.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Edit all rules in $EDITOR; rules removed from the file are deleted after confirmation.
+    Edit,
+    /// Rename a rule.
+    Rename {
+        rule_id: String,
+        name: String,
     },
     /// List folders; rules refer to them by full name.
     Folders,
@@ -124,14 +160,27 @@ fn main() -> Result<()> {
             println!("logged out");
             Ok(())
         }
-        Command::Api(cmd) => {
-            let tokens: Box<dyn TokenSource> = match cli.token_cmd {
-                Some(cmd) => Box::new(CommandTokenSource(cmd)),
-                None => Box::new(stored_token_source().context("no token source")?),
-            };
-            run_api(cmd, &Client::new(tokens))
+        Command::Check { file, online } => {
+            let desired = rules_file::read(&file)?;
+            if online {
+                let client = connect(cli.token_cmd)?;
+                rules_file::lint(&desired, Some(&client.folders()?), &client.list_rules()?)?;
+            } else {
+                rules_file::lint(&desired, None, &[])?;
+            }
+            println!("{}: {} rule(s) ok", file.display(), desired.len());
+            Ok(())
         }
+        Command::Api(cmd) => run_api(cmd, &connect(cli.token_cmd)?),
     }
+}
+
+fn connect(token_cmd: Option<String>) -> Result<Client<Box<dyn TokenSource>>> {
+    let tokens: Box<dyn TokenSource> = match token_cmd {
+        Some(cmd) => Box::new(CommandTokenSource(cmd)),
+        None => Box::new(stored_token_source().context("no token source")?),
+    };
+    Ok(Client::new(tokens))
 }
 
 fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()> {
@@ -141,17 +190,45 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
                 println!("{}", summary(&rule));
             }
         }
-        ApiCommand::Export => println!("{}", serde_json::to_string_pretty(&client.list_rules()?)?),
-        ApiCommand::Import { file } => {
-            let text = fs::read_to_string(&file).with_context(|| file.display().to_string())?;
-            let rules: Vec<Rule> = serde_json::from_str(&text)?;
-            for mut rule in rules {
-                rule.rule_id = None;
-                rule.uri = None;
-                rule.modified = None;
-                client.create_rule(&rule)?;
-                println!("created {}", rule.rule_name);
+        ApiCommand::Export { file, raw, force } => {
+            let rules = client.list_rules()?;
+            let text = if raw {
+                serde_json::to_string_pretty(&rules)?
+            } else {
+                export(&rules)
+            };
+            match file {
+                None => println!("{}", text.trim_end()),
+                Some(file) => {
+                    if file.exists() && !force {
+                        bail!("{} exists; use --force to overwrite", file.display());
+                    }
+                    fs::write(&file, text).with_context(|| file.display().to_string())?;
+                    eprintln!("wrote {} rule(s) to {}", rules.len(), file.display());
+                }
             }
+        }
+        ApiCommand::Apply {
+            file,
+            dry_run,
+            prune,
+            yes,
+        } => {
+            let desired = rules_file::read(&file)?;
+            let changes = rules_file::apply(client, &desired, prune, dry_run, yes)?;
+            if dry_run && changes {
+                std::process::exit(2);
+            }
+        }
+        ApiCommand::Edit => rules_file::edit(client)?,
+        ApiCommand::Rename { rule_id, name } => {
+            let mut rule = client
+                .list_rules()?
+                .into_iter()
+                .find(|r| r.rule_id.as_deref() == Some(&rule_id))
+                .with_context(|| format!("no rule with id {rule_id}"))?;
+            rule.rule_name = name;
+            client.update_rule(&rule)?;
         }
         ApiCommand::Folders => {
             for f in client.folders()? {
@@ -206,7 +283,10 @@ fn summary(rule: &Rule) -> String {
         rule.rule_name,
         describe_condition(&rule.condition),
         actions.join(", "),
-    )
+    ) + &rule_notes(rule)
+        .iter()
+        .map(|n| format!("  [{n}]"))
+        .collect::<String>()
 }
 
 fn describe_action(action: &Action) -> String {
