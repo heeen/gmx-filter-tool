@@ -13,7 +13,7 @@ use crate::{
     PriorityLevel, Result, Rule, Test, actions, condition, effects_of, spec::parse_size, tests_of,
 };
 
-const HEADER: &str = r#"# gmxf rules v2. File order is rule order. A rule is matched to the server by `id`, else by `name`.
+const HEADER: &str = r#"# gmxf rules v2 (grammar: docs/rules-file.md). File order is rule order. Matched by `id`, else `name`.
 #
 #   from.contains = "x"     or ["x", "y"]: one row per value. Fields from | to | to-cc | subject, operators
 #                           contains | not-contains | is | is-not | [not-]starts-with | [not-]ends-with
