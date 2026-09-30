@@ -460,8 +460,8 @@ mod tests {
         };
         vec![
             mk("5", "club"),
-            mk("cef5ab49-8a55", "deluge"),
-            mk("ce12", "Club"),
+            mk("b1e2c3d4-5f60", "firmware"),
+            mk("b1ff", "Club"),
             mk("5f00-aa", "five"),
         ]
     }
@@ -475,10 +475,10 @@ mod tests {
             "5",
             "an exact id wins over a prefix of another"
         );
-        assert_eq!(id("cef5").unwrap(), "cef5ab49-8a55");
-        assert_eq!(id("DELUGE").unwrap(), "cef5ab49-8a55");
+        assert_eq!(id("b1e2").unwrap(), "b1e2c3d4-5f60");
+        assert_eq!(id("FIRMWARE").unwrap(), "b1e2c3d4-5f60");
         assert_eq!(id("5f").unwrap(), "5f00-aa");
-        assert!(id("ce").unwrap_err().to_string().contains("several"));
+        assert!(id("b1").unwrap_err().to_string().contains("several"));
         assert!(
             id("club").unwrap_err().to_string().contains("several"),
             "two rules named club"

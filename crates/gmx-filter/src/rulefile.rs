@@ -1050,7 +1050,7 @@ pub(crate) mod tests {
             {"type": TYPE, "ruleId": "2", "ruleName": "chatter", "active": false, "considerStopped": true,
              "condition": multi("MultiFromComparator", vec![header("From", "CONTAINS", "from", "@chatter.example")]),
              "actions": mv("INBOX/chatter")},
-            {"type": TYPE, "ruleId": "cef5ab49-8a55-48b3-b603-14303a79e7ca", "ruleName": "say \"hi\" \\ ünï", "active": true, "considerStopped": true,
+            {"type": TYPE, "ruleId": "b1e2c3d4-5f60-4a7b-8c9d-0e1f2a3b4c5d", "ruleName": "say \"hi\" \\ ünï", "active": true, "considerStopped": true,
              "condition": multi("MultiSubjectComparator", vec![header("Subject", "STARTS_WITH", "comparand", "[Firmware] it's")]),
              "actions": [{"type": "MoveToFolder", "folder": "INBOX/Firmware"}]},
         ]))

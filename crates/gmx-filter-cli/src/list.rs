@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn long_ids_are_shortened_unless_long() {
         let r = [rule(
-            "cef5ab49-8a55-48b3-b603-14303a79e7ca",
+            "b1e2c3d4-5f60-4a7b-8c9d-0e1f2a3b4c5d",
             "u",
             Mode::Any,
             &["all-new"],
@@ -205,9 +205,9 @@ mod tests {
                 .lines()
                 .nth(1)
                 .unwrap()
-                .starts_with("cef5ab49  u")
+                .starts_with("b1e2c3d4  u")
         );
-        assert!(table(&r, true).contains("cef5ab49-8a55-48b3-b603-14303a79e7ca  u"));
+        assert!(table(&r, true).contains("b1e2c3d4-5f60-4a7b-8c9d-0e1f2a3b4c5d  u"));
     }
 
     #[test]
