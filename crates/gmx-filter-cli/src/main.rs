@@ -4,6 +4,7 @@ use std::{
     path::PathBuf,
 };
 
+mod list;
 mod rules_file;
 
 use rules_file::{Format, Syntax};
@@ -11,9 +12,8 @@ use rules_file::{Format, Syntax};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gmx_filter::{
-    Action, Client, CommandTokenSource, Condition, Config, Effect, HeaderCondition, KnownAction,
-    KnownCondition, KnownHeaderCondition, Mode, Rule, Test, TokenSource, actions, condition,
-    extend_condition, login, logout, password_from_command, rule_notes, stored_token_source,
+    Client, CommandTokenSource, Config, Effect, Mode, Rule, Test, TokenSource, actions, condition,
+    extend_condition, login, logout, password_from_command, stored_token_source,
 };
 use secrecy::SecretString;
 
@@ -70,8 +70,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ApiCommand {
-    /// List rules.
-    List,
+    /// List rules: id, name, whether enabled, and what they do.
+    List {
+        /// Show full ids and every value instead of the first few per condition.
+        #[arg(long, short)]
+        long: bool,
+    },
     /// Write all rules as an editable rules file (stdout without FILE).
     Export {
         file: Option<PathBuf>,
@@ -123,7 +127,8 @@ enum ApiCommand {
     },
     /// Rename a rule.
     Rename {
-        rule_id: String,
+        /// Rule id (or a unique start of it, as `gmxf list` shows) or name.
+        rule: String,
         name: String,
     },
     /// List folders; rules refer to them by full name.
@@ -164,17 +169,24 @@ enum ApiCommand {
     },
     /// Move a rule to a 1-based position in the rule order.
     Move {
-        rule_id: String,
+        /// Rule id (or a unique start of it, as `gmxf list` shows) or name.
+        rule: String,
         position: usize,
     },
+    /// Switch a rule on.
     Enable {
-        rule_id: String,
+        /// Rule id (or a unique start of it, as `gmxf list` shows) or name.
+        rule: String,
     },
+    /// Switch a rule off; it stays saved.
     Disable {
-        rule_id: String,
+        /// Rule id (or a unique start of it, as `gmxf list` shows) or name.
+        rule: String,
     },
+    /// Delete a rule.
     Delete {
-        rule_id: String,
+        /// Rule id (or a unique start of it, as `gmxf list` shows) or name.
+        rule: String,
     },
 }
 
@@ -256,18 +268,32 @@ fn main() -> Result<()> {
 }
 
 /// A rule by id, else by exact name (case-insensitive) if that is unambiguous.
+/// A rule by exact id, by a unique start of its id, or by exact name (case-insensitive).
 fn find_rule<'a>(rules: &'a [Rule], key: &str) -> Result<&'a Rule> {
     if let Some(r) = rules.iter().find(|r| r.rule_id.as_deref() == Some(key)) {
         return Ok(r);
     }
-    let mut named = rules
+    let by_prefix: Vec<&Rule> = rules
         .iter()
-        .filter(|r| r.rule_name.eq_ignore_ascii_case(key));
-    match (named.next(), named.next()) {
-        (Some(r), None) => Ok(r),
-        (None, _) => bail!("no rule with id or name {key:?}"),
-        (Some(_), Some(_)) => bail!("several rules are named {key:?}; use the id from `gmxf list`"),
+        .filter(|r| r.rule_id.as_deref().is_some_and(|id| id.starts_with(key)))
+        .collect();
+    let by_name: Vec<&Rule> = rules
+        .iter()
+        .filter(|r| r.rule_name.eq_ignore_ascii_case(key))
+        .collect();
+    match (&by_prefix[..], &by_name[..]) {
+        ([one], []) | ([], [one]) => Ok(one),
+        ([a], [b]) if a.rule_id == b.rule_id => Ok(a),
+        ([], []) => bail!("no rule with id or name {key:?}"),
+        _ => bail!("{key:?} matches several rules; use more of the id from `gmxf list`"),
     }
+}
+
+/// The id of the rule `key` names (see [`find_rule`]).
+fn rule_id(client: &Client<Box<dyn TokenSource>>, key: &str) -> Result<String> {
+    let rules = client.list_rules()?;
+    let rule = find_rule(&rules, key)?;
+    rule.rule_id.clone().context("the rule has no id")
 }
 
 fn connect(token_cmd: Option<String>) -> Result<Client<Box<dyn TokenSource>>> {
@@ -280,11 +306,7 @@ fn connect(token_cmd: Option<String>) -> Result<Client<Box<dyn TokenSource>>> {
 
 fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()> {
     match cmd {
-        ApiCommand::List => {
-            for rule in client.list_rules()? {
-                println!("{}", summary(&rule));
-            }
-        }
+        ApiCommand::List { long } => print!("{}", list::table(&client.list_rules()?, long)),
         ApiCommand::Export {
             file,
             raw,
@@ -348,12 +370,8 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
                 .transpose()?;
             rules_file::edit(client, rules, only, syntax, simplify)?;
         }
-        ApiCommand::Rename { rule_id, name } => {
-            let mut rule = client
-                .list_rules()?
-                .into_iter()
-                .find(|r| r.rule_id.as_deref() == Some(&rule_id))
-                .with_context(|| format!("no rule with id {rule_id}"))?;
+        ApiCommand::Rename { rule, name } => {
+            let mut rule = find_rule(&client.list_rules()?, &rule)?.clone();
             rule.rule_name = name;
             client.update_rule(&rule)?;
         }
@@ -408,131 +426,63 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
                 client.update_rule(&target)?;
             }
         }
-        ApiCommand::Move { rule_id, position } => {
+        ApiCommand::Move { rule, position } => {
             let mut rules = client.list_rules()?;
-            let Some(from) = rules
+            let id = find_rule(&rules, &rule)?.rule_id.clone();
+            let from = rules
                 .iter()
-                .position(|r| r.rule_id.as_deref() == Some(&rule_id))
-            else {
-                bail!("no rule with id {rule_id}");
-            };
+                .position(|r| r.rule_id == id)
+                .unwrap_or_default();
             let rule = rules.remove(from);
             rules.insert(position.saturating_sub(1).min(rules.len()), rule);
             client.reorder_rules(&rules)?;
         }
-        ApiCommand::Enable { rule_id } => client.set_active(&rule_id, true)?,
-        ApiCommand::Disable { rule_id } => client.set_active(&rule_id, false)?,
-        ApiCommand::Delete { rule_id } => client.delete_rule(&rule_id)?,
+        ApiCommand::Enable { rule } => client.set_active(&rule_id(client, &rule)?, true)?,
+        ApiCommand::Disable { rule } => client.set_active(&rule_id(client, &rule)?, false)?,
+        ApiCommand::Delete { rule } => client.delete_rule(&rule_id(client, &rule)?)?,
     }
     Ok(())
 }
 
-fn summary(rule: &Rule) -> String {
-    let actions: Vec<String> = rule.actions.iter().map(describe_action).collect();
-    format!(
-        "{:<38} {} {:<20} if {} -> {}",
-        rule.rule_id.as_deref().unwrap_or("-"),
-        if rule.active { "on " } else { "off" },
-        rule.rule_name,
-        describe_condition(&rule.condition),
-        actions.join(", "),
-    ) + &rule_notes(rule)
-        .iter()
-        .map(|n| format!("  [{n}]"))
-        .collect::<String>()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn describe_action(action: &Action) -> String {
-    match action {
-        Action::Known(KnownAction::MoveToFolder { folder }) => format!("move {folder}"),
-        Action::Known(KnownAction::CopyToFolder { folder }) => format!("copy {folder}"),
-        Action::Known(KnownAction::MarkSeen) => "read".into(),
-        Action::Known(KnownAction::DeleteMailImmediately) => "delete".into(),
-        Action::Known(KnownAction::CopyForward { receivers, .. }) => {
-            format!("forward {}", receivers.join(","))
-        }
-        Action::Known(KnownAction::TemplatedEmailNotify { pagers, .. }) => {
-            format!("notify {}", pagers.join(","))
-        }
-        Action::Known(KnownAction::Stop) => "stop".into(),
-        Action::Other(v) => v["type"].as_str().unwrap_or("?").to_owned(),
+    fn rules() -> Vec<Rule> {
+        let mk = |id: &str, name: &str| {
+            let mut r = Rule::new(
+                name,
+                condition(Mode::Any, &["all-new".parse().unwrap()]).unwrap(),
+                vec![],
+            );
+            r.rule_id = Some(id.into());
+            r
+        };
+        vec![
+            mk("5", "club"),
+            mk("cef5ab49-8a55", "deluge"),
+            mk("ce12", "Club"),
+            mk("5f00-aa", "five"),
+        ]
     }
-}
 
-fn describe_condition(condition: &Condition) -> String {
-    let joined = |conditions: &[Condition], sep: &str| {
-        let parts: Vec<_> = conditions.iter().map(describe_condition).collect();
-        format!("({})", parts.join(sep))
-    };
-    let headers = |field: &str, inverted: bool, conds: &[HeaderCondition]| {
-        let parts: Vec<_> = conds
-            .iter()
-            .map(|c| describe_header(field, inverted, c))
-            .collect();
-        if parts.len() == 1 {
-            parts.join("")
-        } else {
-            format!("({})", parts.join(" or "))
-        }
-    };
-    match condition {
-        Condition::Known(KnownCondition::AnyOf { conditions }) => joined(conditions, " or "),
-        Condition::Known(KnownCondition::AllOf { conditions }) => joined(conditions, " and "),
-        Condition::Known(KnownCondition::AllNewEmails { .. }) => "all new mail".into(),
-        Condition::Known(KnownCondition::MultiFromComparator {
-            inverted,
-            header_comparator_conditions,
-            ..
-        }) => headers("from", *inverted, header_comparator_conditions),
-        Condition::Known(KnownCondition::MultiToComparator {
-            inverted,
-            header_comparator_conditions,
-            ..
-        }) => headers("to", *inverted, header_comparator_conditions),
-        Condition::Known(KnownCondition::MultiSubjectComparator {
-            inverted,
-            header_comparator_conditions,
-            ..
-        }) => headers("subject", *inverted, header_comparator_conditions),
-        Condition::Known(KnownCondition::SizeOver {
-            inverted,
-            byte_size,
-        }) => {
-            format!("size {} {byte_size}B", if *inverted { "<" } else { ">" })
-        }
-        Condition::Known(KnownCondition::Priority { inverted, level }) => {
-            format!(
-                "priority {} {level:?}",
-                if *inverted { "is not" } else { "is" }
-            )
-        }
-        Condition::Known(KnownCondition::AnyContact { inverted }) => if *inverted {
-            "sender not in address book"
-        } else {
-            "sender in address book"
-        }
-        .into(),
-        Condition::Other(v) => v["type"].as_str().unwrap_or("?").to_owned(),
+    #[test]
+    fn rules_are_found_by_id_prefix_or_name() {
+        let rules = rules();
+        let id = |key: &str| find_rule(&rules, key).map(|r| r.rule_id.clone().unwrap());
+        assert_eq!(
+            id("5").unwrap(),
+            "5",
+            "an exact id wins over a prefix of another"
+        );
+        assert_eq!(id("cef5").unwrap(), "cef5ab49-8a55");
+        assert_eq!(id("DELUGE").unwrap(), "cef5ab49-8a55");
+        assert_eq!(id("5f").unwrap(), "5f00-aa");
+        assert!(id("ce").unwrap_err().to_string().contains("several"));
+        assert!(
+            id("club").unwrap_err().to_string().contains("several"),
+            "two rules named club"
+        );
+        assert!(id("nope").unwrap_err().to_string().contains("no rule"));
     }
-}
-
-fn describe_header(field: &str, inverted: bool, cond: &HeaderCondition) -> String {
-    let HeaderCondition::Known(
-        KnownHeaderCondition::From {
-            comparator, value, ..
-        }
-        | KnownHeaderCondition::Subject {
-            comparator, value, ..
-        }
-        | KnownHeaderCondition::ToCc {
-            comparator, value, ..
-        },
-    ) = cond
-    else {
-        return format!("{field} ?");
-    };
-    format!(
-        "{field} {}{comparator:?} {value:?}",
-        if inverted { "not " } else { "" }
-    )
 }
