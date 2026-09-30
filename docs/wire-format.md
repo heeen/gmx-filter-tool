@@ -93,8 +93,16 @@ contact       = { "type": "AnyContact", "inverted": BOOL } ;                    
 all-new       = { "type": "AllNewEmails", [ "inverted": BOOL ] } ;                     (* ✔ *)
 ```
 
-Entries belong to their group's field (`From` in `MultiFromComparator`, `ToCc` in `MultiToComparator`,
-`Subject` in `MultiSubjectComparator`); whether the server rejects a mismatch is untested. The web UI never
+Entries must belong to their group's field (`From` in `MultiFromComparator`, `ToCc` in `MultiToComparator`,
+`Subject` in `MultiSubjectComparator`); a mismatch is rejected ✔. An entry of type `To` is accepted and stored
+as `ToCc` with `includeCcHeader: false` ✔.
+
+There are no other header fields. Probed and rejected as unreadable (`http-message-not-readable`) ✔: groups
+`MultiCcComparator`, `MultiBccComparator`, `MultiReplyToComparator`, `MultiSenderComparator`,
+`MultiListIdComparator`, `MultiReturnPathComparator`, `MultiBodyComparator`, `MultiHeaderComparator` (also
+with a `headerName`/`name`/`header` key), `MultiToCcComparator`; leaves `HasAttachment`, `Attachment`,
+`BodyContains`, `Body`, `Spam`, `HeaderComparator`. That error comes from settings-bff's own JSON model, so it
+only knows the types listed here, whatever the backend behind it may support. The web UI never
 writes `operator: "AND"`, inverted groups with several entries, or inverted entries; the server accepts
 and returns them unchanged.
 
@@ -189,6 +197,7 @@ Mostly RFC 7807 problem objects:
   "status": 400, "failures": { "request.httpUserAgent": "rejected value [null]" }, "requestid": "…" }
 ```
 
-Seen: `method-argument-not-valid` (write without `User-Agent`), `urn:problem:mam:cats:request-not-acceptable`
+Seen: `urn:problem:neo:http-message-not-readable` (unknown `type`, or an entry that does not fit its group),
+`method-argument-not-valid` (write without `User-Agent`), `urn:problem:mam:cats:request-not-acceptable`
 (406, wrong media type), `urn:problem:mam:cats:access-forbidden` (403). A structurally invalid rule, such as
 a nested group, gets a bare `400` with an empty body.
