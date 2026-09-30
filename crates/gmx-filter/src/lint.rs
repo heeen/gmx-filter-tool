@@ -208,6 +208,20 @@ pub fn check(
                 "moves and copies to the same folder".into(),
             );
         }
+        if effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Move(_)))
+            .count()
+            > 1
+        {
+            push(
+                i,
+                d,
+                Severity::Warning,
+                "moves the mail more than once; the web UI warns this gives unexpected results"
+                    .into(),
+            );
+        }
         if effects.contains(&Effect::Delete) && effects.len() > 1 {
             push(
                 i,
@@ -465,6 +479,10 @@ mod tests {
                 .any(|m| m.contains("moves and copies to the same folder"))
         );
         assert!(w.iter().any(|m| m.contains("deletes the mail")));
+        assert!(
+            w.iter()
+                .any(|m| m.contains("moves the mail more than once"))
+        );
     }
 
     #[test]
