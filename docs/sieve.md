@@ -118,7 +118,9 @@ shows the pieces as separate rules.
 
 ## Open questions
 
-- **Rules without `stop`:** splitting a rule whose pieces don't stop assumes that GMX lets later rules see a
-  message that an earlier rule already moved. This is unverified; check the result on a test message.
+- **Rules without `stop`:** splitting a rule whose pieces don't stop relies on later rules still running.
+  The web UI suggests they do: `Stop` is only added by its option "Keine andere Filterregel auf diese
+  E-Mails anwenden". Untested: whether a later rule sees a message an earlier rule already moved, and what
+  two moves in a row do (last wins, or two copies). Check the result on a test message.
 - **`["to", "cc"]`:** `includeCcHeader: true` has so far only been seen on rules made by older web UIs.
 - **`size :under N`:** reading it as "not over N-1" assumes that GMX's "smaller than" is strict.
