@@ -80,8 +80,14 @@ enum ApiCommand {
         #[arg(long, short)]
         yes: bool,
     },
-    /// Edit all rules in $EDITOR; rules removed from the file are deleted after confirmation.
-    Edit,
+    /// Edit rules in $EDITOR like `crontab -e`: problems are shown in the file until it is valid,
+    /// then the changes are listed and applied after confirmation.
+    ///
+    /// Without RULE all rules are shown and removing a block deletes that rule; with RULE (id or
+    /// name) only that rule is shown. Saving an empty file aborts; failed edits are kept on disk.
+    Edit {
+        rule: Option<String>,
+    },
     /// Rename a rule.
     Rename {
         rule_id: String,
@@ -251,7 +257,13 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
                 std::process::exit(2);
             }
         }
-        ApiCommand::Edit => rules_file::edit(client)?,
+        ApiCommand::Edit { rule } => {
+            let rules = client.list_rules()?;
+            let only = rule
+                .map(|key| find_rule(&rules, &key).cloned())
+                .transpose()?;
+            rules_file::edit(client, rules, only)?;
+        }
         ApiCommand::Rename { rule_id, name } => {
             let mut rule = client
                 .list_rules()?

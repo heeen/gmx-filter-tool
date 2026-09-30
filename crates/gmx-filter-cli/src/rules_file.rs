@@ -1,6 +1,11 @@
 //! `check`, `apply` and `edit`: working with the rules file.
 
-use std::{fs, io, path::Path, process::Command};
+use std::{
+    fs,
+    io::{self, Write as _},
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, bail};
 use gmx_filter::{
@@ -34,11 +39,19 @@ pub fn lint(desired: &[DesiredRule], folders: Option<&[Folder]>, remote: &[Rule]
 }
 
 fn confirm(question: &str) -> Result<bool> {
-    eprint!("{question} [y/N] ");
-    io::Write::flush(&mut io::stderr())?;
+    ask(question, false)
+}
+
+/// A yes/no question on stderr; an empty answer means `default`.
+fn ask(question: &str, default: bool) -> Result<bool> {
+    eprint!("{question} {} ", if default { "[Y/n]" } else { "[y/N]" });
+    io::stderr().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+    Ok(match line.trim() {
+        "" => default,
+        answer => matches!(answer, "y" | "Y" | "yes"),
+    })
 }
 
 /// Shows what applying `desired` would do and, unless `dry_run`, does it after confirmation.
@@ -78,48 +91,226 @@ pub fn apply<T: TokenSource>(
     Ok(true)
 }
 
-/// Export to a temp file, open the editor until the file is valid, then show and apply the plan.
-/// Rules deleted from the file are deleted on the server (after confirmation).
-pub fn edit<T: TokenSource>(client: &Client<T>) -> Result<()> {
-    let remote = client.list_rules()?;
-    let path = std::env::temp_dir().join(format!("gmxf-rules-{}.toml", std::process::id()));
-    fs::write(&path, export(&remote))?;
-    let result = edit_loop(client, &path);
-    let _ = fs::remove_file(&path);
-    result
+/// Lines `gmxf edit` puts above the file to report problems; removed again before parsing.
+const MARK: &str = "# gmxf: ";
+
+/// `text` with a fresh block of `messages` at the top, replacing any earlier block.
+pub fn annotate(text: &str, messages: &[String]) -> String {
+    let mut out: String = messages
+        .iter()
+        .flat_map(|m| m.lines())
+        .map(|line| format!("{MARK}{line}\n"))
+        .collect();
+    if !out.is_empty() {
+        out.push_str(&format!(
+            "{MARK}fix the above and save, or save an empty file to abort\n\n"
+        ));
+    }
+    out + strip_annotations(text)
 }
 
-fn edit_loop<T: TokenSource>(client: &Client<T>, path: &Path) -> Result<()> {
+/// `text` without the block written by [`annotate`].
+pub fn strip_annotations(text: &str) -> &str {
+    let mut rest = text;
+    while rest.starts_with(MARK) {
+        rest = rest.split_once('\n').map_or("", |(_, after)| after);
+    }
+    rest.strip_prefix('\n').unwrap_or(rest)
+}
+
+/// Nothing but blank lines and comments: the way to abort an edit.
+pub fn is_effectively_empty(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .all(|l| l.is_empty() || l.starts_with('#'))
+}
+
+fn edit_header(all: bool, count: usize) -> String {
+    let scope = if all {
+        "# Delete a [[rule]] block to delete that rule, move blocks to reorder, add blocks to create rules.\n"
+    } else {
+        "# Only this rule is shown; other rules are not touched. Add [[rule]] blocks to create rules.\n"
+    };
+    format!(
+        "# gmxf edit: {count} rule(s). Save and quit to review the changes; nothing is applied without asking.\n\
+         {scope}# Save an empty file (comments only) to abort.\n\n"
+    )
+}
+
+fn scratch_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    dir.join(format!("gmxf-edit-{}.toml", std::process::id()))
+}
+
+fn write_private(path: &Path, text: &str) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)?.write_all(text.as_bytes())
+}
+
+fn same_rules(a: &[Rule], b: &[Rule]) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+}
+
+/// What one pass over the edited file came to.
+enum Pass {
+    Abort,
+    NoChanges,
+    Problems(Vec<String>),
+    Ready(Vec<gmx_filter::DesiredRule>, Plan, Vec<Diagnostic>),
+}
+
+/// `crontab -e` for filter rules: edit `only` (or all `rules`) in `$VISUAL`/`$EDITOR`, get errors back in
+/// the file until it is valid, review the plan, apply after confirmation. Your edits are never thrown
+/// away: on any failure the file is kept and its path printed.
+pub fn edit<T: TokenSource>(
+    client: &Client<T>,
+    rules: Vec<Rule>,
+    only: Option<Rule>,
+) -> Result<()> {
+    let all = only.is_none();
+    let shown = only.map_or_else(|| rules.clone(), |r| vec![r]);
+    let original = edit_header(all, shown.len()) + &export(&shown);
+    let path = scratch_path();
+    write_private(&path, &original)?;
+    let kept = |why: &str| {
+        anyhow::anyhow!(
+            "{why}\nyour edits are saved in {0}; re-run `gmxf edit`, or apply them with `gmxf apply {0}{1}`",
+            path.display(),
+            if all { " --prune" } else { "" }
+        )
+    };
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
+
     loop {
         let status = Command::new("sh")
             .arg("-c")
             .arg(format!("{editor} \"$0\""))
-            .arg(path)
+            .arg(&path)
             .status()
             .with_context(|| format!("starting {editor}"))?;
         if !status.success() {
-            bail!("{editor} failed; nothing was changed");
+            return Err(kept(&format!("{editor} exited with {status}")));
         }
-        let outcome = read(path).and_then(|desired| {
-            let changed = apply(client, &desired, true, true, false)?;
-            Ok((desired, changed))
-        });
-        match outcome {
-            Ok((desired, changed)) => {
-                if changed && confirm("Apply these changes?")? {
-                    apply(client, &desired, true, false, true)?;
-                }
+        let edited = fs::read_to_string(&path)?;
+        let body = strip_annotations(&edited);
+
+        let pass = if is_effectively_empty(body) {
+            Pass::Abort
+        } else if body == original {
+            Pass::NoChanges
+        } else {
+            examine(client, &rules, body, all)?
+        };
+        match pass {
+            Pass::Abort => {
+                let _ = fs::remove_file(&path);
+                eprintln!("empty file: aborted, nothing changed");
                 return Ok(());
             }
-            Err(e) => {
-                eprintln!("{e:#}");
-                if !confirm("Edit again?")? {
-                    bail!("aborted; nothing was changed");
+            Pass::NoChanges => {
+                let _ = fs::remove_file(&path);
+                println!("no changes");
+                return Ok(());
+            }
+            Pass::Problems(messages) => {
+                for m in &messages {
+                    eprintln!("{m}");
+                }
+                write_private(&path, &annotate(body, &messages))?;
+                if !ask("Edit again?", true)? {
+                    return Err(kept("not applied"));
                 }
             }
+            Pass::Ready(desired, plan, notes) => {
+                report(&notes);
+                print!("{}", plan.render());
+                let deletes = plan.deletes();
+                let warn = if deletes > 0 {
+                    format!(", including {deletes} deletion(s)")
+                } else {
+                    String::new()
+                };
+                if !confirm(&format!("Apply {} change(s){warn}?", plan.ops.len()))? {
+                    return Err(kept("not applied"));
+                }
+                plan.execute(client, &desired, all)
+                    .map_err(|e| kept(&format!("{e:#}")))?;
+                let _ = fs::remove_file(&path);
+                println!("applied; the server now matches your edit");
+                return Ok(());
+            }
         }
+    }
+}
+
+/// Parses and checks the edited text against the server as it is now.
+fn examine<T: TokenSource>(
+    client: &Client<T>,
+    snapshot: &[Rule],
+    body: &str,
+    prune: bool,
+) -> Result<Pass> {
+    let desired = match gmx_filter::parse(body) {
+        Ok(d) => d,
+        Err(e) => return Ok(Pass::Problems(vec![format!("error: {e}")])),
+    };
+    let remote = client.list_rules()?;
+    if !same_rules(snapshot, &remote) {
+        return Ok(Pass::Problems(vec![
+            "error: the rules on the server changed since this file was written (e.g. in the web UI);\n\
+             applying it now could undo those changes. Save an empty file and re-run `gmxf edit`."
+                .into(),
+        ]));
+    }
+    let diagnostics = check(&desired, Some(&client.folders()?), &remote);
+    if has_errors(&diagnostics) {
+        return Ok(Pass::Problems(
+            diagnostics.iter().map(ToString::to_string).collect(),
+        ));
+    }
+    let plan = match Plan::diff(&remote, &desired, prune) {
+        Ok(plan) => plan,
+        Err(e) => return Ok(Pass::Problems(vec![format!("error: {e}")])),
+    };
+    if plan.is_empty() {
+        return Ok(Pass::NoChanges);
+    }
+    Ok(Pass::Ready(desired, plan, diagnostics))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE: &str = "# header\n\n[[rule]]\nname = \"x\"\n";
+
+    #[test]
+    fn annotations_replace_each_other_and_strip_cleanly() {
+        let once = annotate(
+            FILE,
+            &["error: first\n  | detail".into(), "warning: second".into()],
+        );
+        assert!(
+            once.starts_with("# gmxf: error: first\n# gmxf:   | detail\n# gmxf: warning: second\n")
+        );
+        assert_eq!(strip_annotations(&once), FILE);
+        let twice = annotate(&once, &["error: third".into()]);
+        assert!(!twice.contains("first") && twice.contains("third"));
+        assert_eq!(strip_annotations(&twice), FILE);
+        assert_eq!(annotate(FILE, &[]), FILE);
+        assert_eq!(strip_annotations(FILE), FILE);
+    }
+
+    #[test]
+    fn only_comments_count_as_empty() {
+        assert!(is_effectively_empty(""));
+        assert!(is_effectively_empty("# a\n\n   # b\n"));
+        assert!(!is_effectively_empty(FILE));
+        assert!(is_effectively_empty(&edit_header(false, 1)));
     }
 }
