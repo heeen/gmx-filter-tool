@@ -2,6 +2,7 @@
 
 `gmxf export` writes it, `gmxf check` validates it, `gmxf apply` and `gmxf edit` make the server match it.
 It is TOML (1.1). This document is the complete grammar, its meaning, and how it maps to what GMX stores.
+An experimental Sieve form of the same file is described in [sieve.md](sieve.md).
 
 ## Grammar
 
