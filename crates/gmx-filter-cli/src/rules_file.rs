@@ -91,31 +91,38 @@ pub fn apply<T: TokenSource>(
     Ok(true)
 }
 
-/// Lines `gmxf edit` puts above the file to report problems; removed again before parsing.
+/// Lines `gmxf edit` appends to the file to report problems; removed again before parsing. They go
+/// at the end so the line numbers in the messages stay right for the file you see.
 const MARK: &str = "# gmxf: ";
 
-/// `text` with a fresh block of `messages` at the top, replacing any earlier block.
+/// `text` with a fresh block of `messages` at the end, replacing any earlier block.
 pub fn annotate(text: &str, messages: &[String]) -> String {
-    let mut out: String = messages
-        .iter()
-        .flat_map(|m| m.lines())
-        .map(|line| format!("{MARK}{line}\n"))
-        .collect();
-    if !out.is_empty() {
+    let mut out = strip_annotations(text);
+    if !messages.is_empty() {
         out.push_str(&format!(
-            "{MARK}fix the above and save, or save an empty file to abort\n\n"
+            "\n{MARK}fix the problems below and save, or save an empty file to abort\n"
         ));
+        for line in messages.iter().flat_map(|m| m.lines()) {
+            out.push_str(&format!("{MARK}{line}\n"));
+        }
     }
-    out + strip_annotations(text)
+    out
 }
 
 /// `text` without the block written by [`annotate`].
-pub fn strip_annotations(text: &str) -> &str {
-    let mut rest = text;
-    while rest.starts_with(MARK) {
-        rest = rest.split_once('\n').map_or("", |(_, after)| after);
+pub fn strip_annotations(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    let mut had_block = false;
+    while let Some(last) = lines.last()
+        && (last.starts_with(MARK) || (had_block && last.trim().is_empty()))
+    {
+        had_block |= last.starts_with(MARK);
+        lines.pop();
     }
-    rest.strip_prefix('\n').unwrap_or(rest)
+    if !had_block {
+        return text.to_owned();
+    }
+    lines.iter().map(|l| format!("{l}\n")).collect()
 }
 
 /// Nothing but blank lines and comments: the way to abort an edit.
@@ -198,6 +205,7 @@ pub fn edit<T: TokenSource>(
         }
         let edited = fs::read_to_string(&path)?;
         let body = strip_annotations(&edited);
+        let body = body.as_str();
 
         let pass = if is_effectively_empty(body) {
             Pass::Abort
@@ -290,13 +298,17 @@ mod tests {
     const FILE: &str = "# header\n\n[[rule]]\nname = \"x\"\n";
 
     #[test]
-    fn annotations_replace_each_other_and_strip_cleanly() {
+    fn annotations_go_last_replace_each_other_and_strip_cleanly() {
         let once = annotate(
             FILE,
             &["error: first\n  | detail".into(), "warning: second".into()],
         );
         assert!(
-            once.starts_with("# gmxf: error: first\n# gmxf:   | detail\n# gmxf: warning: second\n")
+            once.starts_with(FILE),
+            "the edited text keeps its line numbers"
+        );
+        assert!(
+            once.ends_with("# gmxf: error: first\n# gmxf:   | detail\n# gmxf: warning: second\n")
         );
         assert_eq!(strip_annotations(&once), FILE);
         let twice = annotate(&once, &["error: third".into()]);
@@ -304,6 +316,12 @@ mod tests {
         assert_eq!(strip_annotations(&twice), FILE);
         assert_eq!(annotate(FILE, &[]), FILE);
         assert_eq!(strip_annotations(FILE), FILE);
+        let own_comment = format!("{FILE}# my own note\n");
+        assert_eq!(
+            strip_annotations(&own_comment),
+            own_comment,
+            "only gmxf's lines are removed"
+        );
     }
 
     #[test]
