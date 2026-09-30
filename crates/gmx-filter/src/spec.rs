@@ -106,10 +106,12 @@ impl FromStr for Test {
                     "is-not" => (Comparator::Is, true),
                     "starts-with" => (Comparator::StartsWith, false),
                     "ends-with" => (Comparator::EndsWith, false),
+                    "not-starts-with" => (Comparator::StartsWith, true),
+                    "not-ends-with" => (Comparator::EndsWith, true),
                     _ => {
                         return Err(invalid(
                             spec,
-                            "contains, not-contains, is, is-not, starts-with or ends-with",
+                            "contains, not-contains, is, is-not, starts-with, not-starts-with, ends-with or not-ends-with",
                         ));
                     }
                 };
@@ -142,7 +144,7 @@ fn split_word(s: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn parse_size(s: &str) -> Option<u64> {
+pub(crate) fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
     let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (n, unit) = s.split_at_checked(digits)?;
@@ -281,7 +283,7 @@ impl fmt::Display for Effect {
 }
 
 /// The condition rows of a rule, or `None` when the condition is not expressible as `--when` rows
-/// with certainty (nested groups, `AND` operators, inverted multi-value groups, unknown values).
+/// with certainty (nested groups, `AND` operators, inverted multi-value groups, unknown comparators).
 /// Structure may differ from what [`condition`] rebuilds (e.g. an `AnyOf` of single-value groups
 /// collapses), but the meaning does not.
 pub fn tests_of(c: &Condition) -> Option<(Mode, Vec<Test>)> {
@@ -306,8 +308,7 @@ pub fn tests_of(c: &Condition) -> Option<(Mode, Vec<Test>)> {
         ),
         _ => (Mode::Any, any_rows(c)?),
     };
-    let stable = |t: &Test| t.to_string().parse::<Test>().is_ok_and(|p| &p == t);
-    (!rows.is_empty() && rows.iter().all(stable)).then_some((mode, rows))
+    (!rows.is_empty()).then_some((mode, rows))
 }
 
 fn single_row(c: &Condition) -> Option<Test> {
@@ -458,8 +459,7 @@ pub fn effects_of(actions: &[Action]) -> Option<(Vec<Effect>, bool)> {
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;
-    let stable = |e: &Effect| e.to_string().parse::<Effect>().is_ok_and(|p| &p == e);
-    (!effects.is_empty() && effects.iter().all(stable)).then_some((effects, stop))
+    (!effects.is_empty()).then_some((effects, stop))
 }
 
 fn row(test: &Test) -> Condition {
@@ -753,6 +753,8 @@ mod tests {
             "to-cc not-contains x y",
             "subject is-not Re: hi",
             "subject starts-with [x]",
+            "subject not-starts-with Re:",
+            "from not-ends-with .de",
             "to ends-with @gmx.de",
             "size gt 5MB",
             "size lt 3KB",
@@ -858,8 +860,8 @@ mod tests {
             "headerComparatorConditions": [{"type": "From", "comparator": "CONTAINS", "inverted": false, "comparand": " a "}]}),
         );
         assert!(
-            tests_of(&padded).is_none(),
-            "surrounding blanks would not survive the spec syntax"
+            matches!(&tests_of(&padded).unwrap().1[..], [Test::Header { value, .. }] if value == " a "),
+            "the typed rules file keeps values exactly"
         );
         let explicit_false = cond(
             json!({"type": "MultiToComparator", "operator": "OR", "inverted": false,
