@@ -7,6 +7,7 @@ mod plan;
 mod rulefile;
 mod session;
 mod sieve;
+mod simplify;
 mod spec;
 mod store;
 mod token;
@@ -19,6 +20,7 @@ pub use plan::{Op, Plan};
 pub use rulefile::{DesiredRule, export, parse, rule_notes};
 pub use session::{login, logout, password_from_command, stored_token_source};
 pub use sieve::{SieveImport, export_sieve, parse_sieve};
+pub use simplify::{Simplified, simplify};
 pub use spec::{
     Effect, HeaderField, Mode, Test, actions, condition, effects_of, extend_condition, tests_of,
 };

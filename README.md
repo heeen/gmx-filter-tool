@@ -70,6 +70,9 @@ new mail". Actions: move, copy, mark as read, delete, forward, notify. The compl
 
 - File order is rule order; moving a block reorders the rules.
 - `apply` keeps server rules that are missing from the file; `--prune` deletes them.
+- `gmxf export --simplify` (and `gmxf edit --simplify`) merges adjacent rules that do the same thing and
+  drops repeated conditions, without changing which mail is affected. The merged rule keeps the first
+  rule's id and name; apply with `--prune` so the merged-away rules are deleted.
 - Rules gmxf cannot express exactly (rare, e.g. created by other clients) are exported as raw JSON
   (`condition_json`, `actions_json`) and written back unchanged.
 

@@ -205,6 +205,14 @@ pub fn is_effectively_empty(text: &str) -> bool {
         .all(|l| l.is_empty() || l.starts_with('#'))
 }
 
+/// `# simplified: …` lines naming what `--simplify` changed, or nothing.
+pub fn simplify_comment(notes: &[String]) -> String {
+    notes
+        .iter()
+        .map(|n| format!("# simplified: {n}\n"))
+        .collect()
+}
+
 fn edit_header(format: Format, all: bool, count: usize) -> String {
     let block = match format {
         Format::Toml => "[[rule]] block",
@@ -262,11 +270,20 @@ pub fn edit<T: TokenSource>(
     rules: Vec<Rule>,
     only: Option<Rule>,
     syntax: Syntax,
+    simplify: bool,
 ) -> Result<()> {
     let format = syntax.format(None)?;
     let all = only.is_none();
-    let shown = only.map_or_else(|| rules.clone(), |r| vec![r]);
-    let original = edit_header(format, all, shown.len()) + &format.export(&shown);
+    let mut shown = only.map_or_else(|| rules.clone(), |r| vec![r]);
+    let mut notes = String::new();
+    if simplify {
+        let simplified = gmx_filter::simplify(&shown);
+        notes = simplify_comment(&simplified.notes);
+        shown = simplified.rules;
+    }
+    // A simplified file differs from the server even when saved untouched.
+    let simplified = !notes.is_empty();
+    let original = edit_header(format, all, shown.len()) + &notes + &format.export(&shown);
     let path = scratch_path(format);
     write_private(&path, &original)?;
     let kept = |why: &str| {
@@ -296,7 +313,7 @@ pub fn edit<T: TokenSource>(
 
         let pass = if is_effectively_empty(body) {
             Pass::Abort
-        } else if body == original {
+        } else if body == original && !simplified {
             Pass::NoChanges
         } else {
             examine(client, &rules, body, all, syntax, format)?

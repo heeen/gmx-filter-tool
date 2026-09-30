@@ -84,6 +84,10 @@ enum ApiCommand {
         /// Overwrite FILE if it exists.
         #[arg(long)]
         force: bool,
+        /// Merge adjacent rules that do the same thing and drop repeated conditions; the rules still
+        /// act on exactly the same mail. Apply the result with --prune to remove the merged rules.
+        #[arg(long, conflicts_with = "raw")]
+        simplify: bool,
     },
     /// Make the server match a rules file; shows the plan first.
     ///
@@ -112,6 +116,10 @@ enum ApiCommand {
         rule: Option<String>,
         #[command(flatten)]
         syntax: Syntax,
+        /// Start from the simplified rules (see `export --simplify`); saving applies the
+        /// simplification, including deleting the merged rules.
+        #[arg(long)]
+        simplify: bool,
     },
     /// Rename a rule.
     Rename {
@@ -282,12 +290,28 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
             raw,
             format,
             force,
+            simplify,
         } => {
-            let rules = client.list_rules()?;
+            let mut rules = client.list_rules()?;
+            let mut notes = String::new();
+            if simplify {
+                let simplified = gmx_filter::simplify(&rules);
+                for note in &simplified.notes {
+                    eprintln!("simplified: {note}");
+                }
+                if simplified.merged_away() > 0 {
+                    eprintln!(
+                        "{} rule(s) were merged into others; `gmxf apply FILE --prune` removes them on the server",
+                        simplified.merged_away()
+                    );
+                }
+                notes = rules_file::simplify_comment(&simplified.notes);
+                rules = simplified.rules;
+            }
             let text = if raw {
                 serde_json::to_string_pretty(&rules)?
             } else {
-                Format::pick(format, file.as_deref()).export(&rules)
+                notes + &Format::pick(format, file.as_deref()).export(&rules)
             };
             match file {
                 None => println!("{}", text.trim_end()),
@@ -313,12 +337,16 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
                 std::process::exit(2);
             }
         }
-        ApiCommand::Edit { rule, syntax } => {
+        ApiCommand::Edit {
+            rule,
+            syntax,
+            simplify,
+        } => {
             let rules = client.list_rules()?;
             let only = rule
                 .map(|key| find_rule(&rules, &key).cloned())
                 .transpose()?;
-            rules_file::edit(client, rules, only, syntax)?;
+            rules_file::edit(client, rules, only, syntax, simplify)?;
         }
         ApiCommand::Rename { rule_id, name } => {
             let mut rule = client
