@@ -29,15 +29,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Log in to GMX webmail with email + password and store the session.
+    /// Log in to GMX webmail and store the session (and, unless --no-remember, the password) in the keyring.
     Login {
         #[arg(long)]
         user: Option<String>,
         /// Read password from stdin instead of prompting (for scripts).
         #[arg(long)]
         password_stdin: bool,
+        /// Do not keep the password in the keyring; expired sessions then need `gmxf login` again.
+        #[arg(long)]
+        no_remember: bool,
     },
-    /// Remove the stored session and config.
+    /// Remove the stored session, password and config.
     Logout,
     /// Check a rules file for syntax errors and suspicious rules (add --online to check folders).
     Check {
@@ -151,6 +154,7 @@ fn main() -> Result<()> {
         Command::Login {
             user,
             password_stdin,
+            no_remember,
         } => {
             let user = match user {
                 Some(u) => u,
@@ -173,8 +177,14 @@ fn main() -> Result<()> {
             } else {
                 SecretString::from(rpassword::prompt_password("Password: ")?)
             };
-            login(&user, &password)?;
-            println!("logged in as {user}");
+            login(&user, &password, !no_remember)?;
+            if no_remember {
+                println!("logged in as {user}");
+            } else {
+                println!(
+                    "logged in as {user}; the password is kept in the keyring to renew the session"
+                );
+            }
             Ok(())
         }
         Command::Logout => {

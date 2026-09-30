@@ -22,6 +22,10 @@ pub enum Error {
     LoginNoSession,
     #[error("login succeeded but the session cannot mint filter tokens: {0}")]
     LoginSessionUnusable(Box<Error>),
+    #[error(
+        "the session expired and logging in again with the stored password failed: {0}\nrun `gmxf login`"
+    )]
+    Relogin(Box<Error>),
     #[error("OAuth2 error (HTTP {status}): {body}")]
     OAuth { status: u16, body: String },
     #[error("unexpected HTTP {status} from {url}: {body}")]

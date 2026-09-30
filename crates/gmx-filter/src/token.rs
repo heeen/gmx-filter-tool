@@ -9,8 +9,7 @@ use reqwest::blocking::Client as Http;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use crate::login::{TOKEN_URL, USER_AGENT};
-use crate::store::SessionStore;
+use crate::login::USER_AGENT;
 use crate::{Error, Result};
 
 /// Scopes settings-bff / mailset need for filter CRUD (from the webmail HAR).
@@ -107,50 +106,87 @@ const EXPIRY_LEEWAY: Duration = Duration::from_secs(60);
 /// Assumed lifetime when the server omits `expires_in`.
 const DEFAULT_LIFETIME: Duration = Duration::from_mins(5);
 
-/// Mints filter-scoped access tokens from the stored webmail session, caching them until they expire.
+/// Logs in again and returns fresh session cookies.
+pub(crate) type Relogin = Box<dyn Fn() -> Result<SecretString>>;
+
+struct State {
+    cookie: Option<SecretString>,
+    cached: Option<(SecretString, Instant)>,
+}
+
+/// Mints filter-scoped access tokens from the webmail session, caching them until they expire.
+/// With a [`Relogin`], an expired (or missing) session is renewed once per call instead of failing.
 pub struct SessionTokenSource {
     http: Http,
     token_url: String,
-    cookie: SecretString,
-    cached: Mutex<Option<(SecretString, Instant)>>,
+    state: Mutex<State>,
+    relogin: Option<Relogin>,
 }
 
 impl SessionTokenSource {
-    pub fn new(store: &impl SessionStore) -> Result<Self> {
-        Self::with_token_url(store, TOKEN_URL)
-    }
-
-    pub(crate) fn with_token_url(store: &impl SessionStore, token_url: &str) -> Result<Self> {
+    pub(crate) fn new(
+        cookie: Option<SecretString>,
+        token_url: &str,
+        relogin: Option<Relogin>,
+    ) -> Result<Self> {
+        if cookie.is_none() && relogin.is_none() {
+            return Err(Error::NotLoggedIn);
+        }
         Ok(Self {
             http: Http::new(),
             token_url: token_url.to_owned(),
-            cookie: store.load()?,
-            cached: Mutex::new(None),
+            state: Mutex::new(State {
+                cookie,
+                cached: None,
+            }),
+            relogin,
         })
+    }
+
+    fn renew(&self, state: &mut State) -> Result<()> {
+        let relogin = self.relogin.as_ref().ok_or(Error::NotLoggedIn)?;
+        state.cookie = Some(relogin().map_err(|e| Error::Relogin(Box::new(e)))?);
+        Ok(())
     }
 }
 
 impl TokenSource for SessionTokenSource {
     fn token(&self) -> Result<SecretString> {
-        let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((token, expires)) = &*cached
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((token, expires)) = &state.cached
             && Instant::now() + EXPIRY_LEEWAY < *expires
         {
             return Ok(SecretString::from(token.expose_secret().to_owned()));
         }
 
-        let resp = match mint(&self.http, &self.token_url, &self.cookie) {
-            Err(Error::OAuth {
-                status: 400 | 401 | 403,
-                ..
-            }) => return Err(Error::NotLoggedIn),
-            other => other?,
+        if state.cookie.is_none() {
+            self.renew(&mut state)?;
+        }
+        let mut renewed = false;
+        let resp = loop {
+            let Some(cookie) = &state.cookie else {
+                return Err(Error::NotLoggedIn);
+            };
+            match mint(&self.http, &self.token_url, cookie) {
+                Err(Error::OAuth {
+                    status: 400 | 401 | 403,
+                    ..
+                }) if !renewed && self.relogin.is_some() => {
+                    self.renew(&mut state)?;
+                    renewed = true;
+                }
+                Err(Error::OAuth {
+                    status: 400 | 401 | 403,
+                    ..
+                }) => return Err(Error::NotLoggedIn),
+                other => break other?,
+            }
         };
         let lifetime = resp
             .expires_in
             .map_or(DEFAULT_LIFETIME, Duration::from_secs);
         let access = SecretString::from(resp.access_token.expose_secret().to_owned());
-        *cached = Some((resp.access_token, Instant::now() + lifetime));
+        state.cached = Some((resp.access_token, Instant::now() + lifetime));
         Ok(access)
     }
 }
@@ -167,7 +203,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct MemStore(pub RefCell<Option<String>>);
 
-    impl SessionStore for MemStore {
+    impl crate::store::SecretStore for MemStore {
         fn load(&self) -> Result<SecretString> {
             let cookie = self.0.borrow().clone();
             cookie.map(SecretString::from).ok_or(Error::NotLoggedIn)
@@ -180,10 +216,6 @@ pub(crate) mod tests {
             *self.0.borrow_mut() = None;
             Ok(())
         }
-    }
-
-    fn store_with(cookie: &str) -> MemStore {
-        MemStore(RefCell::new(Some(cookie.into())))
     }
 
     #[test]
@@ -230,11 +262,9 @@ pub(crate) mod tests {
             .with_body(json!({"access_token": "at", "expires_in": 7200}).to_string())
             .expect(1)
             .create();
-        let src = SessionTokenSource::with_token_url(
-            &store_with("sso=abc"),
-            &format!("{}/token", s.url()),
-        )
-        .unwrap();
+        let src =
+            SessionTokenSource::new(Some("sso=abc".into()), &format!("{}/token", s.url()), None)
+                .unwrap();
         assert_eq!(src.token().unwrap().expose_secret(), "at");
         assert_eq!(src.token().unwrap().expose_secret(), "at");
         m.assert();
@@ -248,9 +278,8 @@ pub(crate) mod tests {
             .with_body(json!({"access_token": "at", "expires_in": 1}).to_string())
             .expect(2)
             .create();
-        let src =
-            SessionTokenSource::with_token_url(&store_with("c=1"), &format!("{}/token", s.url()))
-                .unwrap();
+        let src = SessionTokenSource::new(Some("c=1".into()), &format!("{}/token", s.url()), None)
+            .unwrap();
         src.token().unwrap();
         src.token().unwrap();
         m.assert();
@@ -263,9 +292,8 @@ pub(crate) mod tests {
             .with_status(400)
             .with_body(r#"{"error":"invalid_grant"}"#)
             .create();
-        let src =
-            SessionTokenSource::with_token_url(&store_with("c=1"), &format!("{}/token", s.url()))
-                .unwrap();
+        let src = SessionTokenSource::new(Some("c=1".into()), &format!("{}/token", s.url()), None)
+            .unwrap();
         assert!(matches!(src.token(), Err(Error::NotLoggedIn)));
     }
 
@@ -273,17 +301,105 @@ pub(crate) mod tests {
     fn server_errors_are_not_mistaken_for_expiry() {
         let mut s = Server::new();
         s.mock("POST", "/token").with_status(503).create();
-        let src =
-            SessionTokenSource::with_token_url(&store_with("c=1"), &format!("{}/token", s.url()))
-                .unwrap();
+        let src = SessionTokenSource::new(Some("c=1".into()), &format!("{}/token", s.url()), None)
+            .unwrap();
         assert!(matches!(src.token(), Err(Error::OAuth { status: 503, .. })));
     }
 
     #[test]
     fn missing_store_entry_means_not_logged_in() {
         assert!(matches!(
-            SessionTokenSource::new(&MemStore::default()),
+            SessionTokenSource::new(None, "http://unused", None),
             Err(Error::NotLoggedIn)
         ));
+    }
+
+    fn counting_relogin(
+        cookie: &'static str,
+        calls: &std::rc::Rc<std::cell::Cell<u32>>,
+    ) -> Relogin {
+        let calls = std::rc::Rc::clone(calls);
+        Box::new(move || {
+            calls.update(|n| n + 1);
+            Ok(cookie.into())
+        })
+    }
+
+    #[test]
+    fn an_expired_session_is_renewed_once_and_used() {
+        let mut s = Server::new();
+        s.mock("POST", "/token")
+            .match_header("cookie", "old=1")
+            .with_status(400)
+            .expect(1)
+            .create();
+        let fresh = s
+            .mock("POST", "/token")
+            .match_header("cookie", "new=1")
+            .with_body(json!({"access_token": "at", "expires_in": 7200}).to_string())
+            .expect(1)
+            .create();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let src = SessionTokenSource::new(
+            Some("old=1".into()),
+            &format!("{}/token", s.url()),
+            Some(counting_relogin("new=1", &calls)),
+        )
+        .unwrap();
+        assert_eq!(src.token().unwrap().expose_secret(), "at");
+        assert_eq!(src.token().unwrap().expose_secret(), "at", "cached");
+        assert_eq!(calls.get(), 1);
+        fresh.assert();
+    }
+
+    #[test]
+    fn a_missing_session_logs_in_first() {
+        let mut s = Server::new();
+        s.mock("POST", "/token")
+            .match_header("cookie", "new=1")
+            .with_body(json!({"access_token": "at"}).to_string())
+            .create();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let src = SessionTokenSource::new(
+            None,
+            &format!("{}/token", s.url()),
+            Some(counting_relogin("new=1", &calls)),
+        )
+        .unwrap();
+        assert_eq!(src.token().unwrap().expose_secret(), "at");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_failing_relogin_is_reported_and_not_retried_forever() {
+        let mut s = Server::new();
+        s.mock("POST", "/token").with_status(401).create();
+        let failing: Relogin = Box::new(|| {
+            Err(Error::LoginRejected {
+                step: "password",
+                status: 401,
+                body: String::new(),
+            })
+        });
+        let src = SessionTokenSource::new(
+            Some("old=1".into()),
+            &format!("{}/token", s.url()),
+            Some(failing),
+        )
+        .unwrap();
+        let err = src.token().unwrap_err();
+        assert!(matches!(err, Error::Relogin(_)), "{err}");
+        assert!(err.to_string().contains("gmxf login"));
+
+        // a fresh session that is rejected as well ends the attempt
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let src = SessionTokenSource::new(
+            Some("old=1".into()),
+            &format!("{}/token", s.url()),
+            Some(counting_relogin("new=1", &calls)),
+        )
+        .unwrap();
+        assert!(matches!(src.token(), Err(Error::NotLoggedIn)));
+        assert_eq!(calls.get(), 1);
     }
 }

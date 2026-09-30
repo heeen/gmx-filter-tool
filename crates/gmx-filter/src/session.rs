@@ -2,26 +2,33 @@ use reqwest::blocking::Client as Http;
 use secrecy::SecretString;
 
 use crate::login::{START_URL, TOKEN_URL, web_login};
-use crate::store::{Config, KeyringStore, SessionStore};
-use crate::token::{SessionTokenSource, mint};
+use crate::store::{Config, KeyringStore, SecretStore};
+use crate::token::{Relogin, SessionTokenSource, mint};
 use crate::{Error, Result};
 
-/// Web login; stores the session cookie in the keyring and the account name in the config.
-pub fn login(user: &str, password: &SecretString) -> Result<()> {
+/// Web login; stores the session in the keyring and the account name in the config. With
+/// `remember`, the password is kept in the keyring too so expired sessions renew themselves.
+pub fn login(user: &str, password: &SecretString, remember: bool) -> Result<()> {
     let previous = Config::load().ok().filter(|c| c.user != user);
     login_with(
         START_URL,
         TOKEN_URL,
-        &KeyringStore::new(user),
+        &KeyringStore::session(user),
         user,
         password,
     )?;
+    let stored = KeyringStore::password(user);
+    if remember {
+        stored.save(password)?;
+    } else {
+        stored.delete()?;
+    }
     Config {
         user: user.to_owned(),
     }
     .save()?;
     if let Some(prev) = previous {
-        KeyringStore::new(prev.user).delete()?;
+        forget(&prev.user)?;
     }
     Ok(())
 }
@@ -29,7 +36,7 @@ pub fn login(user: &str, password: &SecretString) -> Result<()> {
 pub fn logout() -> Result<()> {
     match Config::load() {
         Ok(cfg) => {
-            KeyringStore::new(cfg.user).delete()?;
+            forget(&cfg.user)?;
             Config::clear()
         }
         Err(Error::NotLoggedIn) => Ok(()),
@@ -37,23 +44,54 @@ pub fn logout() -> Result<()> {
     }
 }
 
-/// Token source for the account from the last `login`.
-pub fn stored_token_source() -> Result<SessionTokenSource> {
-    let cfg = Config::load()?;
-    SessionTokenSource::new(&KeyringStore::new(cfg.user))
+fn forget(user: &str) -> Result<()> {
+    KeyringStore::session(user).delete()?;
+    KeyringStore::password(user).delete()
 }
 
+/// Token source for the account from the last `login`, renewing the session with the
+/// remembered password when there is one.
+pub fn stored_token_source() -> Result<SessionTokenSource> {
+    let cfg = Config::load()?;
+    let session = KeyringStore::session(&cfg.user);
+    let cookie = optional(session.load())?;
+    let relogin = optional(KeyringStore::password(&cfg.user).load())?.map(|_| {
+        let user = cfg.user.clone();
+        Box::new(move || {
+            let password = KeyringStore::password(&user).load()?;
+            login_with(
+                START_URL,
+                TOKEN_URL,
+                &KeyringStore::session(&user),
+                &user,
+                &password,
+            )
+        }) as Relogin
+    });
+    SessionTokenSource::new(cookie, TOKEN_URL, relogin)
+}
+
+/// `NotLoggedIn` from a store just means the entry is not there.
+fn optional<T>(r: Result<T>) -> Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(Error::NotLoggedIn) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Logs in, checks the session can mint the filter scopes, stores and returns it.
 fn login_with(
     start_url: &str,
     token_url: &str,
-    store: &impl SessionStore,
+    store: &impl SecretStore,
     user: &str,
     password: &SecretString,
-) -> Result<()> {
+) -> Result<SecretString> {
     let cookie = web_login(start_url, token_url, user, password)?;
-    // Only keep a session that can actually mint the filter scopes.
     mint(&Http::new(), token_url, &cookie).map_err(|e| Error::LoginSessionUnusable(Box::new(e)))?;
-    store.save(&cookie)
+    store.save(&cookie)?;
+    Ok(cookie)
 }
 
 #[cfg(test)]
@@ -65,7 +103,7 @@ mod tests {
     use super::*;
     use crate::token::tests::MemStore;
 
-    fn run(s: &Server, store: &MemStore) -> Result<()> {
+    fn run(s: &Server, store: &MemStore) -> Result<SecretString> {
         login_with(
             &format!("{}/go", s.url()),
             &format!("{}/token", s.url()),

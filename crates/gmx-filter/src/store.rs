@@ -10,8 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-const KEYRING_SERVICE: &str = "gmxf";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub user: String,
@@ -55,29 +53,42 @@ impl Config {
     }
 }
 
-/// Persistence for the long-lived session cookie.
-pub trait SessionStore {
+/// One secret per account (the session cookie, or the remembered password).
+pub trait SecretStore {
     fn load(&self) -> Result<SecretString>;
-    fn save(&self, cookie: &SecretString) -> Result<()>;
+    fn save(&self, secret: &SecretString) -> Result<()>;
     fn delete(&self) -> Result<()>;
 }
 
-/// Session cookie in the OS keyring, keyed by account name.
+/// A secret in the OS keyring, keyed by service and account name.
 pub struct KeyringStore {
+    service: &'static str,
     user: String,
 }
 
 impl KeyringStore {
-    pub fn new(user: impl Into<String>) -> Self {
-        Self { user: user.into() }
+    /// The webmail session cookies from the last login.
+    pub fn session(user: impl Into<String>) -> Self {
+        Self {
+            service: "gmxf",
+            user: user.into(),
+        }
+    }
+
+    /// The password, kept so an expired session can be renewed without asking.
+    pub fn password(user: impl Into<String>) -> Self {
+        Self {
+            service: "gmxf-password",
+            user: user.into(),
+        }
     }
 
     fn entry(&self) -> Result<Entry> {
-        Ok(Entry::new(KEYRING_SERVICE, &self.user)?)
+        Ok(Entry::new(self.service, &self.user)?)
     }
 }
 
-impl SessionStore for KeyringStore {
+impl SecretStore for KeyringStore {
     fn load(&self) -> Result<SecretString> {
         match self.entry()?.get_password() {
             Ok(p) if !p.is_empty() => Ok(SecretString::from(p)),
@@ -86,8 +97,8 @@ impl SessionStore for KeyringStore {
         }
     }
 
-    fn save(&self, cookie: &SecretString) -> Result<()> {
-        Ok(self.entry()?.set_password(cookie.expose_secret())?)
+    fn save(&self, secret: &SecretString) -> Result<()> {
+        Ok(self.entry()?.set_password(secret.expose_secret())?)
     }
 
     fn delete(&self) -> Result<()> {
