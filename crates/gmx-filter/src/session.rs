@@ -426,4 +426,41 @@ mod tests {
             "{err}"
         );
     }
+
+    #[test]
+    fn a_rejected_passkey_says_what_gmx_offers_instead() {
+        let mut s = Server::new();
+        browser_pages(&mut s);
+        identification(&mut s);
+        s.mock("POST", "/rest/login-flow/authentication/webauthn-start")
+            .with_body(
+                json!({"nextStep": [{"type": "WEBAUTHN_FINISH", "optionsJson": OPTIONS}]})
+                    .to_string(),
+            )
+            .create();
+        s.mock("POST", "/rest/login-flow/authentication/webauthn-finish")
+            .with_body(
+                json!({"flowState": "ONGOING", "stepSuccess": false,
+                "nextStep": [{"type": "PASSWORD"}, {"type": "WEBAUTHN_START"}]})
+                .to_string(),
+            )
+            .create();
+        let sign = |_: &str, _: &str| Ok("{}".to_owned());
+        let url = s.url();
+        let err = login_with(
+            &format!("{url}/go"),
+            &format!("{url}/token"),
+            &MemStore::default(),
+            "me@gmx.de",
+            Credential::Passkey(&sign),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("did not accept")
+                && err.contains("Some(false)")
+                && err.contains("PASSWORD, WEBAUTHN_START"),
+            "{err}"
+        );
+    }
 }

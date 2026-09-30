@@ -113,6 +113,9 @@ struct Authentication {
     #[cfg(any(feature = "passkey", test))]
     #[serde(default)]
     next_step: Vec<NextStep>,
+    /// `false` when the step was rejected (wrong password, passkey not accepted).
+    #[cfg(any(feature = "passkey", test))]
+    step_success: Option<bool>,
 }
 
 /// Turns a WebAuthn request (`optionsJson`) and the page origin into the credential JSON the login
@@ -232,11 +235,22 @@ pub(crate) fn web_login(
                 .and_then(|s| s.options_json)
                 .ok_or(Error::LoginPage("WEBAUTHN_FINISH optionsJson"))?;
             let credential = sign(&options, &headers.origin)?;
-            flow(
+            let finished = flow(
                 "webauthn-finish",
                 "authentication/webauthn-finish",
                 json!({"factorValue": credential, "sessionId": ident.session_id}),
-            )?
+            )?;
+            if finished.redirect_url.is_none() {
+                let offered: Vec<&str> =
+                    finished.next_step.iter().map(|s| s.kind.as_str()).collect();
+                return Err(Error::Passkey(format!(
+                    "GMX did not accept the passkey (flow {}, step success {:?}, offered next: {})",
+                    finished.flow_state.as_deref().unwrap_or("?"),
+                    finished.step_success,
+                    offered.join(", ")
+                )));
+            }
+            finished
         }
     };
     let Some(redirect) = auth.redirect_url else {
