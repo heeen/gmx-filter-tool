@@ -9,13 +9,86 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use gmx_filter::{
-    Client, DesiredRule, Diagnostic, Folder, Plan, Rule, TokenSource, check, export, has_errors,
-    parse,
+    Client, DesiredRule, Diagnostic, Folder, Plan, Rule, TokenSource, check, export, export_sieve,
+    has_errors, parse, parse_sieve,
 };
 
-pub fn read(file: &Path) -> Result<Vec<DesiredRule>> {
+/// How a rules file is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Format {
+    /// TOML (docs/rules-file.md)
+    Toml,
+    /// Sieve, experimental (docs/sieve.md)
+    Sieve,
+}
+
+/// `--format` and `--split`, for commands that read a rules file.
+#[derive(Debug, Clone, Copy, clap::Args)]
+pub struct Syntax {
+    /// Rules file format; by default `.sieve` files are Sieve, anything else TOML.
+    #[arg(long, value_enum)]
+    format: Option<Format>,
+    /// Sieve only (experimental): turn nested `if`, `elsif`/`else` and conditions nested too deep
+    /// into several GMX rules, named "NAME #1", "NAME #2", ….
+    #[arg(long)]
+    split: bool,
+}
+
+impl Format {
+    /// `explicit`, else guessed from the file name.
+    pub fn pick(explicit: Option<Self>, file: Option<&Path>) -> Self {
+        explicit.unwrap_or_else(|| {
+            if file.and_then(Path::extension).is_some_and(|e| e == "sieve") {
+                Self::Sieve
+            } else {
+                Self::Toml
+            }
+        })
+    }
+
+    pub fn export(self, rules: &[Rule]) -> String {
+        match self {
+            Self::Toml => export(rules),
+            Self::Sieve => export_sieve(rules),
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Toml => "toml",
+            Self::Sieve => "sieve",
+        }
+    }
+}
+
+impl Syntax {
+    pub fn format(self, file: Option<&Path>) -> Result<Format> {
+        let format = Format::pick(self.format, file);
+        if self.split && format != Format::Sieve {
+            bail!("--split only applies to Sieve files");
+        }
+        Ok(format)
+    }
+
+    /// Parses `text`; remarks of the Sieve parser (such as split rules) go to stderr.
+    fn parse(self, format: Format, text: &str) -> Result<Vec<DesiredRule>> {
+        Ok(match format {
+            Format::Toml => parse(text)?,
+            Format::Sieve => {
+                let parsed = parse_sieve(text, self.split)?;
+                for note in &parsed.notes {
+                    eprintln!("note: {note}");
+                }
+                parsed.rules
+            }
+        })
+    }
+}
+
+pub fn read(file: &Path, syntax: Syntax) -> Result<Vec<DesiredRule>> {
+    let format = syntax.format(Some(file))?;
     let text = fs::read_to_string(file).with_context(|| file.display().to_string())?;
-    Ok(parse(&text)?)
+    syntax.parse(format, &text)
 }
 
 fn report(diagnostics: &[Diagnostic]) {
@@ -132,11 +205,19 @@ pub fn is_effectively_empty(text: &str) -> bool {
         .all(|l| l.is_empty() || l.starts_with('#'))
 }
 
-fn edit_header(all: bool, count: usize) -> String {
+fn edit_header(format: Format, all: bool, count: usize) -> String {
+    let block = match format {
+        Format::Toml => "[[rule]] block",
+        Format::Sieve => "`if` block (with its `# rule:` line)",
+    };
     let scope = if all {
-        "# Delete a [[rule]] block to delete that rule, move blocks to reorder, add blocks to create rules.\n"
+        format!(
+            "# Delete a {block} to delete that rule, move blocks to reorder, add blocks to create rules.\n"
+        )
     } else {
-        "# Only this rule is shown; other rules are not touched. Add [[rule]] blocks to create rules.\n"
+        format!(
+            "# Only this rule is shown; other rules are not touched. Add a {block} to create a rule.\n"
+        )
     };
     format!(
         "# gmxf edit: {count} rule(s). Save and quit to review the changes; nothing is applied without asking.\n\
@@ -144,9 +225,13 @@ fn edit_header(all: bool, count: usize) -> String {
     )
 }
 
-fn scratch_path() -> PathBuf {
+fn scratch_path(format: Format) -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-    dir.join(format!("gmxf-edit-{}.toml", std::process::id()))
+    dir.join(format!(
+        "gmxf-edit-{}.{}",
+        std::process::id(),
+        format.extension()
+    ))
 }
 
 fn write_private(path: &Path, text: &str) -> io::Result<()> {
@@ -176,11 +261,13 @@ pub fn edit<T: TokenSource>(
     client: &Client<T>,
     rules: Vec<Rule>,
     only: Option<Rule>,
+    syntax: Syntax,
 ) -> Result<()> {
+    let format = syntax.format(None)?;
     let all = only.is_none();
     let shown = only.map_or_else(|| rules.clone(), |r| vec![r]);
-    let original = edit_header(all, shown.len()) + &export(&shown);
-    let path = scratch_path();
+    let original = edit_header(format, all, shown.len()) + &format.export(&shown);
+    let path = scratch_path(format);
     write_private(&path, &original)?;
     let kept = |why: &str| {
         anyhow::anyhow!(
@@ -212,7 +299,7 @@ pub fn edit<T: TokenSource>(
         } else if body == original {
             Pass::NoChanges
         } else {
-            examine(client, &rules, body, all)?
+            examine(client, &rules, body, all, syntax, format)?
         };
         match pass {
             Pass::Abort => {
@@ -262,8 +349,10 @@ fn examine<T: TokenSource>(
     snapshot: &[Rule],
     body: &str,
     prune: bool,
+    syntax: Syntax,
+    format: Format,
 ) -> Result<Pass> {
-    let desired = match gmx_filter::parse(body) {
+    let desired = match syntax.parse(format, body) {
         Ok(d) => d,
         Err(e) => return Ok(Pass::Problems(vec![format!("error: {e}")])),
     };
@@ -329,6 +418,7 @@ mod tests {
         assert!(is_effectively_empty(""));
         assert!(is_effectively_empty("# a\n\n   # b\n"));
         assert!(!is_effectively_empty(FILE));
-        assert!(is_effectively_empty(&edit_header(false, 1)));
+        assert!(is_effectively_empty(&edit_header(Format::Toml, false, 1)));
+        assert!(is_effectively_empty(&edit_header(Format::Sieve, true, 3)));
     }
 }

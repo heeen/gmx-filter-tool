@@ -6,13 +6,14 @@ use std::{
 
 mod rules_file;
 
+use rules_file::{Format, Syntax};
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gmx_filter::{
     Action, Client, CommandTokenSource, Condition, Config, Effect, HeaderCondition, KnownAction,
     KnownCondition, KnownHeaderCondition, Mode, Rule, Test, TokenSource, actions, condition,
-    export, extend_condition, login, logout, password_from_command, rule_notes,
-    stored_token_source,
+    extend_condition, login, logout, password_from_command, rule_notes, stored_token_source,
 };
 use secrecy::SecretString;
 
@@ -60,6 +61,8 @@ enum Command {
         /// Also compare against the server: unknown folders, new forward targets.
         #[arg(long)]
         online: bool,
+        #[command(flatten)]
+        syntax: Syntax,
     },
     #[command(flatten)]
     Api(ApiCommand),
@@ -69,12 +72,15 @@ enum Command {
 enum ApiCommand {
     /// List rules.
     List,
-    /// Write all rules as an editable TOML file (stdout without FILE).
+    /// Write all rules as an editable rules file (stdout without FILE).
     Export {
         file: Option<PathBuf>,
         /// Print the raw API JSON instead (a backup, not meant for editing).
-        #[arg(long, conflicts_with = "file")]
+        #[arg(long, conflicts_with_all = ["file", "format"])]
         raw: bool,
+        /// Rules file format; by default `.sieve` files are Sieve, anything else TOML.
+        #[arg(long, value_enum)]
+        format: Option<Format>,
         /// Overwrite FILE if it exists.
         #[arg(long)]
         force: bool,
@@ -94,6 +100,8 @@ enum ApiCommand {
         /// Do not ask for confirmation.
         #[arg(long, short)]
         yes: bool,
+        #[command(flatten)]
+        syntax: Syntax,
     },
     /// Edit rules in $EDITOR like `crontab -e`: problems are shown in the file until it is valid,
     /// then the changes are listed and applied after confirmation.
@@ -102,6 +110,8 @@ enum ApiCommand {
     /// name) only that rule is shown. Saving an empty file aborts; failed edits are kept on disk.
     Edit {
         rule: Option<String>,
+        #[command(flatten)]
+        syntax: Syntax,
     },
     /// Rename a rule.
     Rename {
@@ -218,8 +228,12 @@ fn main() -> Result<()> {
             println!("logged out");
             Ok(())
         }
-        Command::Check { file, online } => {
-            let desired = rules_file::read(&file)?;
+        Command::Check {
+            file,
+            online,
+            syntax,
+        } => {
+            let desired = rules_file::read(&file, syntax)?;
             if online {
                 let client = connect(cli.token_cmd)?;
                 rules_file::lint(&desired, Some(&client.folders()?), &client.list_rules()?)?;
@@ -263,12 +277,17 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
                 println!("{}", summary(&rule));
             }
         }
-        ApiCommand::Export { file, raw, force } => {
+        ApiCommand::Export {
+            file,
+            raw,
+            format,
+            force,
+        } => {
             let rules = client.list_rules()?;
             let text = if raw {
                 serde_json::to_string_pretty(&rules)?
             } else {
-                export(&rules)
+                Format::pick(format, file.as_deref()).export(&rules)
             };
             match file {
                 None => println!("{}", text.trim_end()),
@@ -286,19 +305,20 @@ fn run_api(cmd: ApiCommand, client: &Client<Box<dyn TokenSource>>) -> Result<()>
             dry_run,
             prune,
             yes,
+            syntax,
         } => {
-            let desired = rules_file::read(&file)?;
+            let desired = rules_file::read(&file, syntax)?;
             let changes = rules_file::apply(client, &desired, prune, dry_run, yes)?;
             if dry_run && changes {
                 std::process::exit(2);
             }
         }
-        ApiCommand::Edit { rule } => {
+        ApiCommand::Edit { rule, syntax } => {
             let rules = client.list_rules()?;
             let only = rule
                 .map(|key| find_rule(&rules, &key).cloned())
                 .transpose()?;
-            rules_file::edit(client, rules, only)?;
+            rules_file::edit(client, rules, only, syntax)?;
         }
         ApiCommand::Rename { rule_id, name } => {
             let mut rule = client

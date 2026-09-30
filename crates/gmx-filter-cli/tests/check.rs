@@ -9,16 +9,21 @@ then = [{ move = "INBOX/Newsletter" }]
 "#;
 
 fn scratch(name: &str, body: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("gmxf-check-{}-{name}.toml", std::process::id()));
+    let path = std::env::temp_dir().join(format!("gmxf-check-{}-{name}", std::process::id()));
     fs::write(&path, body).unwrap();
     path
 }
 
 fn check(body: &str, name: &str) -> (bool, String) {
-    let file = scratch(name, body);
+    run_check(body, &format!("{name}.toml"), &[])
+}
+
+fn run_check(body: &str, file_name: &str, args: &[&str]) -> (bool, String) {
+    let file = scratch(file_name, body);
     let out = Command::new(env!("CARGO_BIN_EXE_gmxf"))
         .arg("check")
         .arg(&file)
+        .args(args)
         .env_remove("GMXF_TOKEN_CMD")
         .output()
         .unwrap();
@@ -86,4 +91,56 @@ fn sanity_errors_fail_and_warnings_do_not() {
         text.contains("warning:") && text.contains("already in INBOX"),
         "{text}"
     );
+}
+
+const SIEVE: &str = r#"require ["fileinto"];
+# rule:[news]
+if anyof(header :contains "from" "newsletter", header :matches "subject" "[news]*") {
+    fileinto "INBOX/Newsletter";
+    stop;
+}
+"#;
+
+const NESTED: &str = r#"require ["fileinto"];
+# rule:[nested]
+if header :contains "from" "a" {
+    if header :contains "subject" "b" { fileinto "B"; stop; }
+    fileinto "A";
+}
+"#;
+
+#[test]
+fn sieve_files_are_recognised_by_their_extension() {
+    let (ok, text) = run_check(SIEVE, "good.sieve", &[]);
+    assert!(ok, "{text}");
+    assert!(text.contains("1 rule(s) ok"), "{text}");
+    let (ok, text) = run_check(SIEVE, "good.txt", &["--format", "sieve"]);
+    assert!(ok, "{text}");
+    let (ok, _) = run_check(SIEVE, "good.toml", &[]);
+    assert!(!ok, "a .toml file is read as TOML");
+}
+
+#[test]
+fn sieve_errors_name_the_rule_and_the_spot() {
+    let (ok, text) = run_check(&SIEVE.replace(":contains", ":regex"), "regex.sieve", &[]);
+    assert!(!ok);
+    assert!(
+        text.contains("rule \"news\"") && text.contains("line 3") && text.contains(":regex"),
+        "{text}"
+    );
+}
+
+#[test]
+fn nested_sieve_rules_need_split() {
+    let (ok, text) = run_check(NESTED, "nested.sieve", &[]);
+    assert!(!ok);
+    assert!(text.contains("--split"), "{text}");
+    let (ok, text) = run_check(NESTED, "nested.sieve", &["--split"]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("split into 2 rules") && text.contains("2 rule(s) ok"),
+        "{text}"
+    );
+    let (ok, text) = run_check(GOOD, "good.toml", &["--split"]);
+    assert!(!ok && text.contains("only applies to Sieve"), "{text}");
 }

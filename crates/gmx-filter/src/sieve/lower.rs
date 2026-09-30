@@ -986,7 +986,10 @@ impl Lowering {
                         "normal" => PriorityLevel::Normal,
                         "high" => PriorityLevel::High,
                         _ => {
-                            return at(*keys_at, format!("priority {k:?}: use low, normal or high"));
+                            return at(
+                                *keys_at,
+                                format!("priority {k:?}: use low, normal or high"),
+                            );
                         }
                     };
                     Ok(Expr::Leaf(KnownCondition::Priority {
