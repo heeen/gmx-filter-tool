@@ -47,7 +47,7 @@ folder        = STRING ;                                 (* full name as in `gmx
 address       = STRING ;
 ```
 
-`JSON-STRING` is a TOML string holding API JSON (see [Wire format](#wire-format)); export writes it as a
+`JSON-STRING` is a TOML string holding API JSON (see [wire-format.md](wire-format.md)); export writes it as a
 `'''…'''` multi-line literal.
 
 Example:
@@ -116,37 +116,9 @@ then-spec = "read" | "delete" | ( "move" | "copy" | "forward" | "notify" ) WS TE
 `gmxf add NAME --when … [--when …] --then … [--all] [--no-stop]`, and
 `gmxf extend RULE VALUE… [--field from|to|to-cc|subject]` for adding `contains` rows.
 
-## Wire format
+## Mapping to the wire format
 
-What `https://settings-bff.gmx.net/filterRules` accepts, as verified against the live server (see
-`re/NOTES.md` for the probes).
-
-```ebnf
-rule        = { "type": "StoppingNamedOrderedConditionalMultiActionUser",
-                "ruleName": STRING, "active": BOOL, "considerStopped": BOOL,
-                "condition": condition, "actions": [ action… ] }
-              (* GET adds "ruleId", "uri", "modified" *) ;
-condition   = group | leaf ;
-group       = { "type": "AnyOf" | "AllOf", "conditions": [ leaf… ] } ;   (* groups do not nest: 400 *)
-leaf        = { "type": "MultiFromComparator" | "MultiToComparator" | "MultiSubjectComparator",
-                "operator": "OR" | "AND", "inverted": BOOL,
-                "headerComparatorConditions": [ header… ] }
-            | { "type": "SizeOver", "inverted": BOOL, "byteSize": UINT }
-            | { "type": "Priority", "inverted": BOOL, "level": "LOW" | "NORMAL" | "HIGH" }
-            | { "type": "AnyContact", "inverted": BOOL }
-            | { "type": "AllNewEmails" }               (* returned as "NewMail"; "inverted" is dropped *) ;
-header      = { "type": "From" | "Subject" | "ToCc", "comparator": comparator, "inverted": BOOL,
-                "comparand": STRING, [ "includeCcHeader": BOOL ] }   (* ToCc only *) ;
-              (* reads of older rules: value under "from"/"to"/"subject", type "To" *)
-comparator  = "CONTAINS" | "IS" | "STARTS_WITH" | "ENDS_WITH" ;
-action      = { "type": "MoveToFolder" | "CopyToFolder", "folder": STRING }
-            | { "type": "MarkSeen" } | { "type": "DeleteMailImmediately" }
-            | { "type": "CopyForward", "pending": BOOL, "receivers": [ STRING… ] }
-            | { "type": "TemplatedEmailNotify", "pending": BOOL, "pagers": [ STRING… ] }
-            | { "type": "Stop" } ;                     (* last *)
-```
-
-How the file maps onto it:
+The API grammar is in [wire-format.md](wire-format.md). How the file maps onto it:
 
 - A single row becomes a single leaf; `match = "all"` over several rows becomes `AllOf`; `"any"` over
   several non-negated rows of one header field becomes one `Multi…Comparator` (operator `OR`); any other
