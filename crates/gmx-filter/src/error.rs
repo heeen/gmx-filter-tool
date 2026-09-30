@@ -1,8 +1,10 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("token command failed: {0}")]
-    TokenCommand(String),
-    #[error("not logged in or session expired; run `gmxf login` or pass --token-cmd")]
+    #[error("{what} command failed: {detail}")]
+    Command { what: &'static str, detail: String },
+    #[error(
+        "not logged in or session expired; run `gmxf login`, or set `password_cmd` in the config to renew sessions automatically"
+    )]
     NotLoggedIn,
     #[error("login rejected at {step} step (HTTP {status}): {body}")]
     LoginRejected {
@@ -23,7 +25,7 @@ pub enum Error {
     #[error("login succeeded but the session cannot mint filter tokens: {0}")]
     LoginSessionUnusable(Box<Error>),
     #[error(
-        "the session expired and logging in again with the stored password failed: {0}\nrun `gmxf login`"
+        "the session expired and logging in again with `password_cmd` failed: {0}\nrun `gmxf login`"
     )]
     Relogin(Box<Error>),
     #[error("OAuth2 error (HTTP {status}): {body}")]
@@ -44,22 +46,19 @@ pub enum Error {
     InvalidSpec(String),
     #[error("rule has no ruleId; use a rule returned by list_rules")]
     MissingRuleId,
+    #[error("{}: {message}", path.display())]
+    Config {
+        path: std::path::PathBuf,
+        message: String,
+    },
     #[error("no config directory available")]
     NoConfigDir,
-    #[error("keyring: {0}")]
-    Keyring(String),
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-}
-
-impl From<keyring::Error> for Error {
-    fn from(e: keyring::Error) -> Self {
-        Error::Keyring(e.to_string())
-    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

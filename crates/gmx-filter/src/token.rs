@@ -32,25 +32,30 @@ impl<T: TokenSource + ?Sized> TokenSource for Box<T> {
     }
 }
 
+/// Runs `cmd` with `sh -c` and returns its stdout. `what` names the command in errors.
+pub(crate) fn run_secret_command(what: &'static str, cmd: &str) -> Result<SecretString> {
+    let fail = |detail: String| Error::Command { what, detail };
+    let out = Command::new("sh").arg("-c").arg(cmd).output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(fail(format!("{}: {}", out.status, stderr.trim())));
+    }
+    let stdout = String::from_utf8(out.stdout).map_err(|_| fail("stdout is not UTF-8".into()))?;
+    Ok(SecretString::from(stdout))
+}
+
 /// Runs a shell command on every call and uses its trimmed stdout as the token.
 pub struct CommandTokenSource(pub String);
 
 impl TokenSource for CommandTokenSource {
     fn token(&self) -> Result<SecretString> {
-        let out = Command::new("sh").arg("-c").arg(&self.0).output()?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(Error::TokenCommand(format!(
-                "{}: {}",
-                out.status,
-                stderr.trim()
-            )));
-        }
-        let stdout = String::from_utf8(out.stdout)
-            .map_err(|_| Error::TokenCommand("stdout is not UTF-8".into()))?;
-        let token = stdout.trim();
+        let out = run_secret_command("token", &self.0)?;
+        let token = out.expose_secret().trim();
         if token.is_empty() {
-            return Err(Error::TokenCommand("empty output".into()));
+            return Err(Error::Command {
+                what: "token",
+                detail: "empty output".into(),
+            });
         }
         Ok(SecretString::from(token.to_owned()))
     }

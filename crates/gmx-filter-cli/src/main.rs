@@ -9,9 +9,10 @@ mod rules_file;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gmx_filter::{
-    Action, Client, CommandTokenSource, Condition, Effect, HeaderCondition, KnownAction,
+    Action, Client, CommandTokenSource, Condition, Config, Effect, HeaderCondition, KnownAction,
     KnownCondition, KnownHeaderCondition, Mode, Rule, Test, TokenSource, actions, condition,
-    export, extend_condition, login, logout, rule_notes, stored_token_source,
+    export, extend_condition, login, logout, password_from_command, rule_notes,
+    stored_token_source,
 };
 use secrecy::SecretString;
 
@@ -29,18 +30,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Log in to GMX webmail and store the session (and, unless --no-remember, the password) in the keyring.
+    /// Log in to GMX webmail and store the session.
+    ///
+    /// The email comes from --user, else the config, else a prompt; the password from
+    /// --password-stdin, else `password_cmd` in the config, else a prompt.
     Login {
         #[arg(long)]
         user: Option<String>,
         /// Read password from stdin instead of prompting (for scripts).
         #[arg(long)]
         password_stdin: bool,
-        /// Do not keep the password in the keyring; expired sessions then need `gmxf login` again.
-        #[arg(long)]
-        no_remember: bool,
     },
-    /// Remove the stored session, password and config.
+    /// Show or change the settings in ~/.config/gmxf/config.toml.
+    ///
+    /// With `password_cmd` set (e.g. `rbw get gmx.net name@gmx.de`), expired sessions are
+    /// renewed without asking.
+    Config {
+        #[arg(long)]
+        email: Option<String>,
+        /// Shell command printing the password; an empty string removes it.
+        #[arg(long)]
+        password_cmd: Option<String>,
+    },
+    /// Forget the stored session (the config stays).
     Logout,
     /// Check a rules file for syntax errors and suspicious rules (add --online to check folders).
     Check {
@@ -154,9 +166,9 @@ fn main() -> Result<()> {
         Command::Login {
             user,
             password_stdin,
-            no_remember,
         } => {
-            let user = match user {
+            let cfg = Config::load()?;
+            let user = match user.or(cfg.email) {
                 Some(u) => u,
                 None => {
                     eprint!("Email: ");
@@ -174,17 +186,31 @@ fn main() -> Result<()> {
                 let mut line = String::new();
                 io::stdin().read_line(&mut line)?;
                 SecretString::from(line.trim_end_matches(['\r', '\n']).to_owned())
+            } else if let Some(cmd) = &cfg.password_cmd {
+                password_from_command(cmd)?
             } else {
                 SecretString::from(rpassword::prompt_password("Password: ")?)
             };
-            login(&user, &password, !no_remember)?;
-            if no_remember {
-                println!("logged in as {user}");
-            } else {
-                println!(
-                    "logged in as {user}; the password is kept in the keyring to renew the session"
-                );
+            login(&user, &password)?;
+            println!("logged in as {user}");
+            Ok(())
+        }
+        Command::Config {
+            email,
+            password_cmd,
+        } => {
+            let mut cfg = Config::load()?;
+            if email.is_some() || password_cmd.is_some() {
+                if let Some(email) = email {
+                    cfg.email = Some(email);
+                }
+                if let Some(cmd) = password_cmd {
+                    cfg.password_cmd = Some(cmd).filter(|c| !c.trim().is_empty());
+                }
+                cfg.save()?;
             }
+            println!("# {}", Config::path()?.display());
+            print!("{}", toml::to_string(&cfg)?);
             Ok(())
         }
         Command::Logout => {

@@ -1,83 +1,63 @@
 use reqwest::blocking::Client as Http;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::login::{START_URL, TOKEN_URL, web_login};
-use crate::store::{Config, KeyringStore, SecretStore};
-use crate::token::{Relogin, SessionTokenSource, mint};
+use crate::store::{Config, FileStore, SecretStore};
+use crate::token::{Relogin, SessionTokenSource, mint, run_secret_command};
 use crate::{Error, Result};
 
-/// Web login; stores the session in the keyring and the account name in the config. With
-/// `remember`, the password is kept in the keyring too so expired sessions renew themselves.
-pub fn login(user: &str, password: &SecretString, remember: bool) -> Result<()> {
-    let previous = Config::load().ok().filter(|c| c.user != user);
+/// Web login; stores the session and remembers the email in the config.
+pub fn login(email: &str, password: &SecretString) -> Result<()> {
     login_with(
         START_URL,
         TOKEN_URL,
-        &KeyringStore::session(user),
-        user,
+        &FileStore::session()?,
+        email,
         password,
     )?;
-    let stored = KeyringStore::password(user);
-    if remember {
-        stored.save(password)?;
-    } else {
-        stored.delete()?;
-    }
-    Config {
-        user: user.to_owned(),
-    }
-    .save()?;
-    if let Some(prev) = previous {
-        forget(&prev.user)?;
+    let mut cfg = Config::load()?;
+    if cfg.email.as_deref() != Some(email) {
+        cfg.email = Some(email.to_owned());
+        cfg.save()?;
     }
     Ok(())
 }
 
+/// Forgets the session; the config stays.
 pub fn logout() -> Result<()> {
-    match Config::load() {
-        Ok(cfg) => {
-            forget(&cfg.user)?;
-            Config::clear()
-        }
-        Err(Error::NotLoggedIn) => Ok(()),
-        Err(e) => Err(e),
+    FileStore::session()?.delete()
+}
+
+/// The password printed by `password_cmd` (one trailing newline removed).
+pub fn password_from_command(cmd: &str) -> Result<SecretString> {
+    let out = run_secret_command("password", cmd)?;
+    let password = out.expose_secret().trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        return Err(Error::Command {
+            what: "password",
+            detail: "empty output".into(),
+        });
     }
+    Ok(SecretString::from(password.to_owned()))
 }
 
-fn forget(user: &str) -> Result<()> {
-    KeyringStore::session(user).delete()?;
-    KeyringStore::password(user).delete()
-}
-
-/// Token source for the account from the last `login`, renewing the session with the
-/// remembered password when there is one.
+/// Token source for the stored session, renewed through `password_cmd` when it is configured.
 pub fn stored_token_source() -> Result<SessionTokenSource> {
     let cfg = Config::load()?;
-    let session = KeyringStore::session(&cfg.user);
-    let cookie = optional(session.load())?;
-    let relogin = optional(KeyringStore::password(&cfg.user).load())?.map(|_| {
-        let user = cfg.user.clone();
-        Box::new(move || {
-            let password = KeyringStore::password(&user).load()?;
-            login_with(
-                START_URL,
-                TOKEN_URL,
-                &KeyringStore::session(&user),
-                &user,
-                &password,
-            )
-        }) as Relogin
-    });
+    let session = FileStore::session()?;
+    let cookie = match session.load() {
+        Ok(c) => Some(c),
+        Err(Error::NotLoggedIn) => None,
+        Err(e) => return Err(e),
+    };
+    let relogin = match (cfg.email, cfg.password_cmd) {
+        (Some(email), Some(cmd)) => Some(Box::new(move || {
+            let password = password_from_command(&cmd)?;
+            login_with(START_URL, TOKEN_URL, &session, &email, &password)
+        }) as Relogin),
+        _ => None,
+    };
     SessionTokenSource::new(cookie, TOKEN_URL, relogin)
-}
-
-/// `NotLoggedIn` from a store just means the entry is not there.
-fn optional<T>(r: Result<T>) -> Result<Option<T>> {
-    match r {
-        Ok(v) => Ok(Some(v)),
-        Err(Error::NotLoggedIn) => Ok(None),
-        Err(e) => Err(e),
-    }
 }
 
 /// Logs in, checks the session can mint the filter scopes, stores and returns it.
@@ -311,5 +291,19 @@ mod tests {
         let err = run(&s, &store).unwrap_err();
         assert!(matches!(err, Error::LoginSessionUnusable(_)));
         assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn password_command_output_keeps_everything_but_the_newline() {
+        let pw = password_from_command("printf ' pa ss \\n'").unwrap();
+        assert_eq!(pw.expose_secret(), " pa ss ");
+        assert!(password_from_command("printf ''").is_err());
+        let err = password_from_command("echo locked >&2; exit 1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("password command failed") && err.contains("locked"),
+            "{err}"
+        );
     }
 }
