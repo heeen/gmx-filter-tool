@@ -32,13 +32,26 @@ impl<T: TokenSource + ?Sized> TokenSource for Box<T> {
     }
 }
 
+/// A command's stderr for an error message: control characters dropped, at most a few lines.
+fn readable(stderr: &[u8]) -> String {
+    const MAX_CHARS: usize = 300;
+    let text: String = String::from_utf8_lossy(stderr)
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect();
+    let text = text.trim();
+    match text.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_owned(),
+    }
+}
+
 /// Runs `cmd` with `sh -c` and returns its stdout. `what` names the command in errors.
 pub(crate) fn run_secret_command(what: &'static str, cmd: &str) -> Result<SecretString> {
     let fail = |detail: String| Error::Command { what, detail };
     let out = Command::new("sh").arg("-c").arg(cmd).output()?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(fail(format!("{}: {}", out.status, stderr.trim())));
+        return Err(fail(format!("{}: {}", out.status, readable(&out.stderr))));
     }
     let stdout = String::from_utf8(out.stdout).map_err(|_| fail("stdout is not UTF-8".into()))?;
     Ok(SecretString::from(stdout))
@@ -406,5 +419,18 @@ pub(crate) mod tests {
         .unwrap();
         assert!(matches!(src.token(), Err(Error::NotLoggedIn)));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn command_errors_are_readable() {
+        let err = CommandTokenSource(
+            "printf 'locked\\0\\0\\0\\n' >&2; head -c 2000 /dev/zero | tr '\\0' x >&2; exit 1"
+                .into(),
+        )
+        .token()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("locked") && !err.contains('\0'), "{err}");
+        assert!(err.chars().count() < 400, "{} chars", err.chars().count());
     }
 }
