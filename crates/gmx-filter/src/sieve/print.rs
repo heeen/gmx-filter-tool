@@ -66,7 +66,13 @@ fn render(rule: &Rule, native_condition: bool, native_actions: bool) -> Option<(
         let _ = writeln!(out, "# gmxf-id: {id}");
     }
     let test = if native_condition {
-        condition(&rule.condition, &mut caps, rule.active)?
+        let col = if rule.active {
+            "if "
+        } else {
+            "if allof(false, "
+        }
+        .len();
+        condition(&rule.condition, &mut caps, Some(At { line: 0, col }))?
     } else {
         let _ = writeln!(
             out,
@@ -102,8 +108,20 @@ fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// `top` lays the tests of an `anyof`/`allof` out one per line.
-fn condition(c: &Condition, caps: &mut Caps, top: bool) -> Option<String> {
+/// Where a test that may span several lines starts: the indent of its line and its column.
+#[derive(Clone, Copy)]
+struct At {
+    line: usize,
+    col: usize,
+}
+
+/// Key lists longer than this go one key per line.
+const INLINE_KEYS: usize = 3;
+const INLINE_WIDTH: usize = 60;
+
+/// With `at`, the tests of an `anyof`/`allof` go one per line and long key lists break; without it
+/// everything stays on one line.
+fn condition(c: &Condition, caps: &mut Caps, at: Option<At>) -> Option<String> {
     let Condition::Known(known) = c else {
         return None;
     };
@@ -115,15 +133,18 @@ fn condition(c: &Condition, caps: &mut Caps, top: bool) -> Option<String> {
             } else {
                 "allof"
             };
+            let child = at.map(|at| {
+                let col = at.col + name.len() + "(".len();
+                At { line: col, col }
+            });
             let parts = conditions
                 .iter()
-                .map(|c| condition(c, caps, false))
+                .map(|c| condition(c, caps, child))
                 .collect::<Option<Vec<_>>>()?;
-            let sep = if top {
-                format!(",\n{}", " ".repeat("if (".len() + name.len()))
-            } else {
-                ", ".to_owned()
-            };
+            let sep = child.map_or_else(
+                || ", ".to_owned(),
+                |child| format!(",\n{}", " ".repeat(child.col)),
+            );
             format!("{name}({})", parts.join(&sep))
         }
         KnownCondition::AllNewEmails { inverted: false } => "true".to_owned(),
@@ -154,7 +175,7 @@ fn condition(c: &Condition, caps: &mut Caps, top: bool) -> Option<String> {
                 quote(ADDRESS_BOOK)
             )
         }
-        other => group(&Group::of(other)?)?,
+        other => group(&Group::of(other)?, at)?,
     })
 }
 
@@ -215,7 +236,7 @@ fn key(value: &str, comparator: &Comparator) -> String {
     })
 }
 
-fn group(g: &Group) -> Option<String> {
+fn group(g: &Group, at: Option<At>) -> Option<String> {
     let parts = g
         .entries
         .iter()
@@ -227,9 +248,18 @@ fn group(g: &Group) -> Option<String> {
         .all(|((h, f, _, _), inverted)| h == how && f == fields && !inverted);
     let body = if uniform && (g.op == Operator::Or || parts.len() == 1) {
         let keys: Vec<String> = parts.iter().map(|((_, _, v, c), _)| key(v, c)).collect();
-        let keys = match keys.as_slice() {
-            [one] => one.clone(),
-            _ => format!("[{}]", keys.join(", ")),
+        let inline = keys.join(", ");
+        let keys = match (keys.as_slice(), at) {
+            ([one], _) => one.clone(),
+            (_, Some(at)) if keys.len() > INLINE_KEYS || inline.len() > INLINE_WIDTH => {
+                let indent = " ".repeat(at.line + 4);
+                format!(
+                    "[\n{indent}{}\n{}]",
+                    keys.join(&format!(",\n{indent}")),
+                    " ".repeat(at.line)
+                )
+            }
+            _ => format!("[{inline}]"),
         };
         format!("header {how} {fields} {keys}")
     } else {

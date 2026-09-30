@@ -245,6 +245,38 @@ fn output_reads_like_sieve() {
 }
 
 #[test]
+fn long_key_lists_go_one_per_line() {
+    let many = |kind: &str, n: usize| {
+        let entries = (1..=n)
+            .map(|i| h(kind, "CONTAINS", &format!("sender{i}@example.org"), false))
+            .collect();
+        group(&format!("Multi{kind}Comparator"), "OR", false, entries)
+    };
+    let set = rules(json!([
+        rule("top", many("From", 4), move_stop("X")),
+        rule(
+            "in-any",
+            json!({"type": "AnyOf", "conditions": [many("From", 4), subject("s")]}),
+            move_stop("X")
+        ),
+        rule("short", many("From", 2), move_stop("X")),
+    ]));
+    let mut off = set[0].clone();
+    off.active = false;
+    let text = export_sieve(&[set.clone(), vec![off]].concat());
+    for expected in [
+        "if header :contains \"from\" [\n    \"sender1@example.org\",\n    \"sender2@example.org\",\n    \"sender3@example.org\",\n    \"sender4@example.org\"\n] {",
+        "if anyof(header :contains \"from\" [\n             \"sender1@example.org\",",
+        "             \"sender4@example.org\"\n         ],\n         header :contains \"subject\" \"s\") {",
+        "if header :contains \"from\" [\"sender1@example.org\", \"sender2@example.org\"] {",
+        "if allof(false, header :contains \"from\" [\n    \"sender1@example.org\",",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+    }
+    assert!(!text.contains("gmxf-condition: "), "{text}");
+}
+
+#[test]
 fn imports_a_handwritten_script() {
     let text = format!(
         "{REQUIRE}\
