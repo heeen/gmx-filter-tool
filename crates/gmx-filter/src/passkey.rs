@@ -15,6 +15,112 @@ use webauthn_authenticator_rs::ui::Cli;
 
 use crate::{Error, Result};
 
+/// The relays phones use to send the answer: which one depends on the phone.
+const RELAYS: [(&str, &str); 2] = [
+    ("cable.ua5v.com", "Google, used by Android phones"),
+    ("cable.auth.com", "Apple, used by iPhones"),
+];
+const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What `gmxf login --passkey` needs on this computer, checked before the QR code is shown.
+#[derive(Debug)]
+pub struct PasskeyCheck {
+    /// The powered adapter, or why there is none.
+    pub bluetooth: std::result::Result<String, String>,
+    /// Each relay with its role, and whether it answered over HTTPS.
+    pub relays: Vec<(&'static str, &'static str, std::result::Result<(), String>)>,
+}
+
+impl PasskeyCheck {
+    pub fn ready(&self) -> bool {
+        self.bluetooth.is_ok() && self.relays.iter().any(|(_, _, r)| r.is_ok())
+    }
+
+    /// The first thing that stops a passkey login, if any.
+    fn problem(&self) -> Option<String> {
+        if let Err(e) = &self.bluetooth {
+            return Some(e.clone());
+        }
+        if !self.relays.iter().any(|(_, _, r)| r.is_ok()) {
+            return Some("none of the passkey relays is reachable (network or firewall?)".into());
+        }
+        None
+    }
+}
+
+impl std::fmt::Display for PasskeyCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.bluetooth {
+            Ok(adapter) => writeln!(f, "Bluetooth  ok ({adapter})")?,
+            Err(e) => writeln!(f, "Bluetooth  {e}")?,
+        }
+        for (host, role, result) in &self.relays {
+            match result {
+                Ok(()) => writeln!(f, "relay      {host} reachable ({role})")?,
+                Err(e) => writeln!(f, "relay      {host} NOT reachable ({role}): {e}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Checks Bluetooth and the relays without logging in.
+pub fn check() -> Result<PasskeyCheck> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let bluetooth = runtime.block_on(bluetooth());
+    drop(runtime);
+    let http = reqwest::blocking::Client::builder()
+        .timeout(RELAY_TIMEOUT)
+        .build()?;
+    let relays = RELAYS
+        .iter()
+        .map(|&(host, role)| {
+            // Any HTTP answer means the relay is reachable; it only speaks WebSocket on its paths.
+            let result = http
+                .get(format!("https://{host}/"))
+                .send()
+                .map(drop)
+                .map_err(|e| {
+                    let source = std::error::Error::source(&e).map(ToString::to_string);
+                    source.unwrap_or_else(|| e.to_string())
+                });
+            (host, role, result)
+        })
+        .collect();
+    Ok(PasskeyCheck { bluetooth, relays })
+}
+
+async fn bluetooth() -> std::result::Result<String, String> {
+    use btleplug::api::{Central, CentralState, Manager as _};
+    let manager = btleplug::platform::Manager::new()
+        .await
+        .map_err(|e| format!("not available: {e}"))?;
+    let adapters = manager
+        .adapters()
+        .await
+        .map_err(|e| format!("not available: {e}"))?;
+    if adapters.is_empty() {
+        return Err("no Bluetooth adapter found".into());
+    }
+    let mut off = Vec::new();
+    for adapter in adapters {
+        let name = adapter
+            .adapter_info()
+            .await
+            .unwrap_or_else(|_| "adapter".into());
+        match adapter.adapter_state().await {
+            Ok(CentralState::PoweredOn) => return Ok(name),
+            _ => off.push(name),
+        }
+    }
+    Err(format!(
+        "Bluetooth is off ({}); switch it on",
+        off.join(", ")
+    ))
+}
+
 fn failed(e: WebauthnCError) -> Error {
     let hint = if e == WebauthnCError::PermissionDenied {
         " (Bluetooth access denied)"
@@ -30,6 +136,9 @@ const MAX_TIMEOUT_MS: u32 = 60_000;
 /// Signs the login page's WebAuthn request as `origin` and returns the credential JSON the page
 /// would post.
 pub(crate) fn sign(options_json: &str, origin: &str) -> Result<String> {
+    if let Some(problem) = check()?.problem() {
+        return Err(Error::Passkey(problem));
+    }
     let options = request_options(options_json)?.public_key;
     let timeout_ms = options
         .timeout
@@ -115,6 +224,52 @@ mod tests {
         assert_eq!(r.public_key.rp_id, "gmx.net");
         assert!(r.public_key.allow_credentials.is_empty());
         assert!(request_options(r#"{"nope":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_check_is_ready_with_bluetooth_and_one_relay() {
+        let check = |bluetooth: std::result::Result<String, String>, google: bool, apple: bool| {
+            PasskeyCheck {
+                bluetooth,
+                relays: vec![
+                    (
+                        "g",
+                        "G",
+                        if google {
+                            Ok(())
+                        } else {
+                            Err("timeout".into())
+                        },
+                    ),
+                    ("a", "A", if apple { Ok(()) } else { Err("timeout".into()) }),
+                ],
+            }
+        };
+        assert!(check(Ok("hci0".into()), true, false).ready());
+        assert!(!check(Ok("hci0".into()), false, false).ready());
+        assert_eq!(
+            check(
+                Err("Bluetooth is off (hci0); switch it on".into()),
+                true,
+                true
+            )
+            .problem()
+            .unwrap(),
+            "Bluetooth is off (hci0); switch it on"
+        );
+        assert!(
+            check(Ok("hci0".into()), false, false)
+                .problem()
+                .unwrap()
+                .contains("relays")
+        );
+        let text = check(Ok("hci0".into()), true, false).to_string();
+        assert!(
+            text.contains("Bluetooth  ok (hci0)")
+                && text.contains("g reachable")
+                && text.contains("a NOT reachable"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -66,6 +66,8 @@ gmxf login
   and the phone nearby, and a build with the `passkey` feature. The passkey stays on the phone; gmxf only
   gets the signed answer, as a browser would. An expired session is still renewed with `password_cmd`, if
   set; otherwise run `gmxf login --passkey` again.
+- `gmxf login --passkey --check` only checks that Bluetooth is on and that the relays phones use for the
+  answer (Google's for Android, Apple's for iPhones) are reachable; `--passkey` runs the same check first.
 - The settings live in `~/.config/gmxf/config.toml`; `gmxf config` shows them.
 - The webmail session (cookies) is stored in `~/.local/state/gmxf/session`, readable only by you. Your
   password is never stored by gmxf. `gmxf logout` removes the session.

@@ -18,6 +18,8 @@ pub use client::{Client, Folder};
 pub use error::{Error, Result};
 pub use lint::{Diagnostic, Severity, check, has_errors};
 pub use model::*;
+#[cfg(feature = "passkey")]
+pub use passkey::{PasskeyCheck, check as passkey_check};
 pub use plan::{Op, Plan};
 pub use rulefile::{DesiredRule, export, parse, rule_notes};
 #[cfg(feature = "passkey")]

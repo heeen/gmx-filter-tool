@@ -46,6 +46,10 @@ enum Command {
         #[cfg(feature = "passkey")]
         #[arg(long, conflicts_with = "password_stdin")]
         passkey: bool,
+        /// With --passkey: only check Bluetooth and the relays the phone uses, then exit.
+        #[cfg(feature = "passkey")]
+        #[arg(long, requires = "passkey")]
+        check: bool,
     },
     /// Show or change the settings in ~/.config/gmxf/config.toml.
     ///
@@ -203,7 +207,19 @@ fn main() -> Result<()> {
             password_stdin,
             #[cfg(feature = "passkey")]
             passkey,
+            #[cfg(feature = "passkey")]
+            check,
         } => {
+            #[cfg(feature = "passkey")]
+            if check {
+                let report = gmx_filter::passkey_check()?;
+                print!("{report}");
+                if !report.ready() {
+                    bail!("passkey login would not work here");
+                }
+                println!("ready for `gmxf login --passkey`");
+                return Ok(());
+            }
             let cfg = Config::load()?;
             let user = match user.or(cfg.email) {
                 Some(u) => u,
