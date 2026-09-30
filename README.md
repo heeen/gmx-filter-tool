@@ -138,4 +138,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
