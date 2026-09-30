@@ -21,11 +21,32 @@ $ gmxf edit newsletter                            # or edit it in $EDITOR, cront
 
 ## Install
 
-Requires Rust 1.91 or newer (edition 2024).
+gmxf is a Rust program. You need Rust 1.91 or newer (edition 2024); get it with [rustup](https://rustup.rs)
+(`rustup update` if you have an older one).
+
+Straight from GitHub:
 
 ```sh
-cargo install --path crates/gmx-filter-cli     # installs the `gmxf` binary
+cargo install --git https://github.com/heeen/gmx-filter-tool
 ```
+
+Or from a checkout:
+
+```sh
+git clone https://github.com/heeen/gmx-filter-tool
+cd gmx-filter-tool
+cargo install --path crates/gmx-filter-cli
+```
+
+Either way the `gmxf` binary ends up in `~/.cargo/bin`, which rustup puts on your `PATH`. Check with
+`gmxf --help`.
+
+- The repository is a workspace (a library and the CLI), so a plain `cargo install` in its root fails with
+  "found a virtual manifest"; point it at `crates/gmx-filter-cli` as above.
+- To update, run the same command again (add `--force` if cargo says the version is already installed).
+- To remove it: `cargo uninstall gmx-filter-cli`, plus `~/.config/gmxf` and `~/.local/state/gmxf` if you
+  want its settings and session gone.
+- Without installing: `cargo build --release` puts the binary at `target/release/gmxf`.
 
 ## Log in
 
