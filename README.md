@@ -81,6 +81,25 @@ applied after confirmation. Deleting a rule's block deletes the rule, saving an 
 edits are kept on disk if anything fails. `gmxf edit RULE` edits a single rule (by id or name). If the rules
 change on the server while you edit (e.g. in the web UI), the edit is refused instead of undoing that change.
 
+### Sieve (experimental)
+
+The same rules can be written in Sieve, the filter language of most IMAP servers: files ending in `.sieve`
+(or `--format sieve`) work with `export`, `check`, `apply` and `edit`.
+
+```sieve
+require ["fileinto"];
+
+# rule:[Newsletter]
+if header :contains "from" ["newsletter", "news@"] {
+    fileinto "INBOX/Newsletter";
+    stop;
+}
+```
+
+GMX does not run Sieve. gmxf translates the subset GMX rules can store and refuses the rest with a reason.
+With `--split`, nested `if`, `elsif`/`else` and conditions nested too deep become several GMX rules.
+Details and open questions: [docs/sieve.md](docs/sieve.md).
+
 ## Quick commands
 
 | command | |
@@ -110,7 +129,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - `crates/gmx-filter` – library: login and tokens, API client, rule model, rules file, diff/apply, checks.
 - `crates/gmx-filter-cli` – the `gmxf` binary.
-- `docs/` – [rules file grammar](docs/rules-file.md) and [wire format](docs/wire-format.md) of the GMX API.
+- `docs/` – [rules file grammar](docs/rules-file.md), its [Sieve form](docs/sieve.md) and the
+  [wire format](docs/wire-format.md) of the GMX API.
 - `re/` – reverse-engineering notes; `re/sanitize_har.py` strips secrets from browser HAR recordings.
 
 ## License
