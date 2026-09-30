@@ -4,8 +4,8 @@ const GOOD: &str = r#"
 [[rule]]
 name = "news"
 match = "any"
-when = ["from contains newsletter", "subject starts-with [news]"]
-then = ["move INBOX/Newsletter"]
+when = [{ from.contains = "newsletter" }, { subject.starts-with = "[news]" }]
+then = [{ move = "INBOX/Newsletter" }]
 "#;
 
 fn scratch(name: &str, body: &str) -> PathBuf {
@@ -39,13 +39,23 @@ fn a_valid_file_passes_offline_without_a_login() {
 }
 
 #[test]
-fn syntax_errors_name_the_rule_and_the_spec() {
+fn syntax_errors_point_at_the_spot_and_list_the_options() {
     let (ok, text) = check(&GOOD.replace("starts-with", "wobbles"), "spec");
     assert!(!ok);
     assert!(
-        text.contains("\"news\"") && text.contains("wobbles"),
+        text.contains("line 5") && text.contains("wobbles") && text.contains("not-ends-with"),
         "{text}"
     );
+}
+
+#[test]
+fn old_string_rows_get_a_re_export_hint() {
+    let (ok, text) = check(
+        "[[rule]]\nname = \"x\"\nwhen = [\"from contains a\"]\nthen = [\"read\"]\n",
+        "v1",
+    );
+    assert!(!ok);
+    assert!(text.contains("re-export"), "{text}");
 }
 
 #[test]
@@ -58,7 +68,10 @@ fn toml_errors_carry_a_line_number() {
 #[test]
 fn sanity_errors_fail_and_warnings_do_not() {
     let (ok, text) = check(
-        &GOOD.replace("move INBOX/Newsletter", "forward nobody"),
+        &GOOD.replace(
+            r#"{ move = "INBOX/Newsletter" }"#,
+            r#"{ forward = "nobody" }"#,
+        ),
         "addr",
     );
     assert!(!ok);
@@ -67,7 +80,7 @@ fn sanity_errors_fail_and_warnings_do_not() {
         "{text}"
     );
 
-    let (ok, text) = check(&GOOD.replace("move INBOX/Newsletter", "move INBOX"), "warn");
+    let (ok, text) = check(&GOOD.replace("INBOX/Newsletter", "INBOX"), "warn");
     assert!(ok, "{text}");
     assert!(
         text.contains("warning:") && text.contains("already in INBOX"),

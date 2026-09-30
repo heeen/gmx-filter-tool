@@ -1,31 +1,32 @@
 //! The editable rules file: one `[[rule]]` table per rule, in rule order.
 //!
-//! Conditions and actions are written as the one-line `--when` / `--then` specs of
-//! [`crate::spec`]; anything those cannot express is kept as JSON so it survives unchanged.
+//! Conditions and actions are typed TOML (`{ from.contains = "x" }`, `{ move = "INBOX/X" }`); anything
+//! they cannot express is kept as JSON so it survives unchanged.
 
 use std::fmt::Write as _;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 use crate::{
-    Action, Condition, Effect, Error, KnownAction, KnownCondition, Mode, Result, Rule, Test,
-    actions, condition, effects_of, tests_of,
+    Action, Comparator, Condition, Effect, Error, HeaderField, KnownAction, KnownCondition, Mode,
+    PriorityLevel, Result, Rule, Test, actions, condition, effects_of, spec::parse_size, tests_of,
 };
 
-const HEADER: &str = "\
-# gmxf rules v1. File order is rule order. A rule is matched to the server by `id`, else by `name`.
+const HEADER: &str = r#"# gmxf rules v2. File order is rule order. A rule is matched to the server by `id`, else by `name`.
 #
-#   match = \"any\" | \"all\"     whether one or every `when` line must hold
-#   when  = [\"from|to|to-cc|subject contains|not-contains|is|is-not|starts-with|ends-with <text>\",
-#            \"size gt|lt <n>[B|KB|MB]\", \"priority is|is-not low|normal|high\",
-#            \"contact saved|not-saved\", \"all-new\"]
-#   then  = [\"move <folder>\", \"copy <folder>\", \"read\", \"delete\", \"forward <address>\", \"notify <address>\"]
-#   stop  = true             false lets later rules see the mail as well
-#   condition_json / actions_json   raw API JSON for what the lines above cannot express
-";
+#   match = "any" | "all"   whether one or every `when` row must hold (default "any")
+#   when  = [ { from.contains = "x" }      from | to | to-cc | subject  .  contains | not-contains | is | is-not
+#             { size.gt = "5MB" }            | starts-with | not-starts-with | ends-with | not-ends-with
+#             { priority.is = "high" }     size . gt | lt  ("500KB", "5MB" or bytes);  priority . is | is-not
+#             { contact = "saved" }        contact = saved | not-saved;  "all-new"
+#   then  = [ { move = "INBOX/X" }, { copy = "INBOX/X" }, "read", "delete",
+#             { forward = "a@b.de" }, { notify = "a@b.de" } ]
+#   stop  = true            false lets later rules see the mail as well
+#   condition_json / actions_json   raw API JSON for what the rows above cannot express
+"#;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum MatchMode {
     #[default]
@@ -51,14 +52,323 @@ impl From<Mode> for MatchMode {
     }
 }
 
+/// One condition row: `{ <field>.<op> = <value> }` or a bare string for value-less rows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum When {
+    AllNew,
+    From(HeaderOp),
+    To(HeaderOp),
+    ToCc(HeaderOp),
+    Subject(HeaderOp),
+    Size(SizeOp),
+    Priority(PriorityOp),
+    Contact(Contact),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum HeaderOp {
+    Contains(String),
+    NotContains(String),
+    Is(String),
+    IsNot(String),
+    StartsWith(String),
+    NotStartsWith(String),
+    EndsWith(String),
+    NotEndsWith(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SizeOp {
+    Gt(Bytes),
+    Lt(Bytes),
+}
+
+/// A byte count, written as `"5MB"`, `"300KB"`, `"120B"` or a plain integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bytes(u64);
+
+impl<'de> Deserialize<'de> for Bytes {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Count(u64),
+            Text(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Count(n) => Ok(Bytes(n)),
+            Raw::Text(s) => parse_size(&s).map(Bytes).ok_or_else(|| {
+                D::Error::custom(format!("{s:?} is not a size like \"500KB\" or \"5MB\""))
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PriorityOp {
+    Is(Level),
+    IsNot(Level),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Level {
+    Low,
+    Normal,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Contact {
+    Saved,
+    NotSaved,
+}
+
+/// One action row: `{ <action> = <target> }` or a bare string for target-less actions.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Then {
+    Move(String),
+    Copy(String),
+    Read,
+    Delete,
+    Forward(String),
+    Notify(String),
+}
+
+impl HeaderOp {
+    fn new(comparator: &Comparator, negated: bool, value: String) -> Option<Self> {
+        Some(match (comparator, negated) {
+            (Comparator::Contains, false) => HeaderOp::Contains(value),
+            (Comparator::Contains, true) => HeaderOp::NotContains(value),
+            (Comparator::Is, false) => HeaderOp::Is(value),
+            (Comparator::Is, true) => HeaderOp::IsNot(value),
+            (Comparator::StartsWith, false) => HeaderOp::StartsWith(value),
+            (Comparator::StartsWith, true) => HeaderOp::NotStartsWith(value),
+            (Comparator::EndsWith, false) => HeaderOp::EndsWith(value),
+            (Comparator::EndsWith, true) => HeaderOp::NotEndsWith(value),
+            (Comparator::Other(_), _) => return None,
+        })
+    }
+
+    fn parts(&self) -> (&'static str, Comparator, bool, &str) {
+        match self {
+            HeaderOp::Contains(v) => ("contains", Comparator::Contains, false, v),
+            HeaderOp::NotContains(v) => ("not-contains", Comparator::Contains, true, v),
+            HeaderOp::Is(v) => ("is", Comparator::Is, false, v),
+            HeaderOp::IsNot(v) => ("is-not", Comparator::Is, true, v),
+            HeaderOp::StartsWith(v) => ("starts-with", Comparator::StartsWith, false, v),
+            HeaderOp::NotStartsWith(v) => ("not-starts-with", Comparator::StartsWith, true, v),
+            HeaderOp::EndsWith(v) => ("ends-with", Comparator::EndsWith, false, v),
+            HeaderOp::NotEndsWith(v) => ("not-ends-with", Comparator::EndsWith, true, v),
+        }
+    }
+}
+
+impl Level {
+    fn of(level: &PriorityLevel) -> Option<Self> {
+        match level {
+            PriorityLevel::Low => Some(Level::Low),
+            PriorityLevel::Normal => Some(Level::Normal),
+            PriorityLevel::High => Some(Level::High),
+            PriorityLevel::Other(_) => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Level::Low => "low",
+            Level::Normal => "normal",
+            Level::High => "high",
+        }
+    }
+
+    fn level(self) -> PriorityLevel {
+        match self {
+            Level::Low => PriorityLevel::Low,
+            Level::Normal => PriorityLevel::Normal,
+            Level::High => PriorityLevel::High,
+        }
+    }
+}
+
+impl When {
+    /// `None` for values the file syntax has no name for (unknown comparators or levels).
+    fn of(test: &Test) -> Option<Self> {
+        Some(match test {
+            Test::AllNewEmails => When::AllNew,
+            Test::Header {
+                field,
+                comparator,
+                negated,
+                value,
+            } => {
+                let op = HeaderOp::new(comparator, *negated, value.clone())?;
+                match field {
+                    HeaderField::From => When::From(op),
+                    HeaderField::To => When::To(op),
+                    HeaderField::ToCc => When::ToCc(op),
+                    HeaderField::Subject => When::Subject(op),
+                }
+            }
+            Test::Size { larger, bytes } => When::Size(if *larger {
+                SizeOp::Gt(Bytes(*bytes))
+            } else {
+                SizeOp::Lt(Bytes(*bytes))
+            }),
+            Test::Priority { negated, level } => {
+                let level = Level::of(level)?;
+                When::Priority(if *negated {
+                    PriorityOp::IsNot(level)
+                } else {
+                    PriorityOp::Is(level)
+                })
+            }
+            Test::Contact { saved } => When::Contact(if *saved {
+                Contact::Saved
+            } else {
+                Contact::NotSaved
+            }),
+        })
+    }
+
+    fn test(&self) -> Test {
+        let header = |field, op: &HeaderOp| {
+            let (_, comparator, negated, value) = op.parts();
+            Test::Header {
+                field,
+                comparator,
+                negated,
+                value: value.to_owned(),
+            }
+        };
+        match self {
+            When::AllNew => Test::AllNewEmails,
+            When::From(op) => header(HeaderField::From, op),
+            When::To(op) => header(HeaderField::To, op),
+            When::ToCc(op) => header(HeaderField::ToCc, op),
+            When::Subject(op) => header(HeaderField::Subject, op),
+            When::Size(SizeOp::Gt(Bytes(bytes))) => Test::Size {
+                larger: true,
+                bytes: *bytes,
+            },
+            When::Size(SizeOp::Lt(Bytes(bytes))) => Test::Size {
+                larger: false,
+                bytes: *bytes,
+            },
+            When::Priority(PriorityOp::Is(l)) => Test::Priority {
+                negated: false,
+                level: l.level(),
+            },
+            When::Priority(PriorityOp::IsNot(l)) => Test::Priority {
+                negated: true,
+                level: l.level(),
+            },
+            When::Contact(c) => Test::Contact {
+                saved: *c == Contact::Saved,
+            },
+        }
+    }
+
+    /// The row as TOML: `{ from.contains = "x" }` or `"all-new"`.
+    fn toml(&self) -> String {
+        let (field, op, value) = match self {
+            When::AllNew => return toml_str("all-new"),
+            When::Contact(c) => {
+                let v = if *c == Contact::Saved {
+                    "saved"
+                } else {
+                    "not-saved"
+                };
+                return format!("{{ contact = {} }}", toml_str(v));
+            }
+            When::From(op) | When::To(op) | When::ToCc(op) | When::Subject(op) => {
+                let field = match self {
+                    When::From(_) => "from",
+                    When::To(_) => "to",
+                    When::ToCc(_) => "to-cc",
+                    _ => "subject",
+                };
+                let (name, _, _, value) = op.parts();
+                (field, name, toml_str(value))
+            }
+            When::Size(op) => {
+                let (name, Bytes(b)) = match op {
+                    SizeOp::Gt(b) => ("gt", b),
+                    SizeOp::Lt(b) => ("lt", b),
+                };
+                ("size", name, size_toml(*b))
+            }
+            When::Priority(op) => {
+                let (name, level) = match op {
+                    PriorityOp::Is(l) => ("is", l),
+                    PriorityOp::IsNot(l) => ("is-not", l),
+                };
+                ("priority", name, toml_str(level.name()))
+            }
+        };
+        format!("{{ {field}.{op} = {value} }}")
+    }
+}
+
+fn size_toml(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    match bytes {
+        b if b > 0 && b % (KB * KB) == 0 => toml_str(&format!("{}MB", b / (KB * KB))),
+        b if b > 0 && b % KB == 0 => toml_str(&format!("{}KB", b / KB)),
+        b => b.to_string(),
+    }
+}
+
+impl Then {
+    fn of(effect: &Effect) -> Self {
+        match effect.clone() {
+            Effect::Move(f) => Then::Move(f),
+            Effect::Copy(f) => Then::Copy(f),
+            Effect::MarkRead => Then::Read,
+            Effect::Delete => Then::Delete,
+            Effect::Forward(a) => Then::Forward(a),
+            Effect::Notify(a) => Then::Notify(a),
+        }
+    }
+
+    fn effect(&self) -> Effect {
+        match self.clone() {
+            Then::Move(f) => Effect::Move(f),
+            Then::Copy(f) => Effect::Copy(f),
+            Then::Read => Effect::MarkRead,
+            Then::Delete => Effect::Delete,
+            Then::Forward(a) => Effect::Forward(a),
+            Then::Notify(a) => Effect::Notify(a),
+        }
+    }
+
+    fn toml(&self) -> String {
+        let (key, value) = match self {
+            Then::Read => return toml_str("read"),
+            Then::Delete => return toml_str("delete"),
+            Then::Move(v) => ("move", v),
+            Then::Copy(v) => ("copy", v),
+            Then::Forward(v) => ("forward", v),
+            Then::Notify(v) => ("notify", v),
+        };
+        format!("{{ {key} = {} }}", toml_str(value))
+    }
+}
+
 const fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleEntry {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     id: Option<String>,
     name: String,
     #[serde(default = "yes")]
@@ -66,14 +376,14 @@ struct RuleEntry {
     #[serde(default, rename = "match")]
     mode: MatchMode,
     #[serde(default)]
-    when: Vec<String>,
+    when: Vec<When>,
     #[serde(default)]
-    then: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    then: Vec<Then>,
+    #[serde(default)]
     stop: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     condition_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     actions_json: Option<String>,
 }
 
@@ -92,29 +402,45 @@ pub struct DesiredRule {
     pub active: bool,
     pub condition: Condition,
     pub actions: Vec<Action>,
-    /// Normalized text form, comparable with [`entry_of`] of a server rule.
+    /// Normalized form, comparable with [`entry_of`] of a server rule.
     canon: RuleEntry,
 }
 
+fn show_when(rows: &[When], sep: &str) -> String {
+    rows.iter()
+        .map(|w| w.test().to_string())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+fn show_then(rows: &[Then]) -> String {
+    rows.iter()
+        .map(|t| t.effect().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl DesiredRule {
-    /// One line for previews: the conditions and actions in file syntax.
+    /// One line for previews, in the `--when` / `--then` wording.
     pub fn summary(&self) -> String {
         let c = &self.canon;
         let when = if c.when.is_empty() {
             "raw condition".to_owned()
         } else {
-            let sep = if c.mode == MatchMode::All {
-                " AND "
-            } else {
-                " OR "
-            };
-            c.when.join(sep)
+            show_when(
+                &c.when,
+                if c.mode == MatchMode::All {
+                    " AND "
+                } else {
+                    " OR "
+                },
+            )
         };
         let then = if c.then.is_empty() {
             "raw actions".to_owned()
         } else {
             let stop = if c.stop == Some(false) { "" } else { ", stop" };
-            format!("{}{stop}", c.then.join(", "))
+            format!("{}{stop}", show_then(&c.then))
         };
         format!("if {when} -> {then}")
     }
@@ -126,7 +452,7 @@ impl DesiredRule {
         theirs == self.canon
     }
 
-    /// Text-level differences to `remote`, for display: `(field, before, after)`.
+    /// Differences to `remote`, for display: `(field, before, after)`.
     pub fn changes(&self, remote: &Rule) -> Vec<(&'static str, String, String)> {
         let theirs = entry_of(remote);
         let ours = &self.canon;
@@ -143,8 +469,12 @@ impl DesiredRule {
             format!("{:?}", theirs.mode),
             format!("{:?}", ours.mode),
         );
-        diff("when", theirs.when.join("; "), ours.when.join("; "));
-        diff("then", theirs.then.join("; "), ours.then.join("; "));
+        diff(
+            "when",
+            show_when(&theirs.when, "; "),
+            show_when(&ours.when, "; "),
+        );
+        diff("then", show_then(&theirs.then), show_then(&ours.then));
         diff(
             "stop",
             theirs.stop.map_or(String::new(), |s| s.to_string()),
@@ -226,20 +556,22 @@ fn compact(json: &str) -> std::result::Result<String, serde_json::Error> {
 
 /// The text form of a server rule; the inverse of building a rule from an entry.
 fn entry_of(rule: &Rule) -> RuleEntry {
-    let (mode, when, condition_json) = match tests_of(&rule.condition) {
-        Some((mode, tests)) => (
-            mode.into(),
-            tests.iter().map(Test::to_string).collect(),
-            None,
-        ),
+    let rows = tests_of(&rule.condition).and_then(|(mode, tests)| {
+        let rows = tests.iter().map(When::of).collect::<Option<Vec<_>>>()?;
+        // `match` only means something with several rows
+        let mode = if rows.len() < 2 {
+            MatchMode::Any
+        } else {
+            mode.into()
+        };
+        Some((mode, rows))
+    });
+    let (mode, when, condition_json) = match rows {
+        Some((mode, rows)) => (mode, rows, None),
         None => (MatchMode::Any, Vec::new(), canonical_json(&rule.condition)),
     };
     let (then, stop, actions_json) = match effects_of(&rule.actions) {
-        Some((effects, stop)) => (
-            effects.iter().map(Effect::to_string).collect(),
-            Some(stop),
-            None,
-        ),
+        Some((effects, stop)) => (effects.iter().map(Then::of).collect(), Some(stop), None),
         None => (Vec::new(), None, canonical_json(&rule.actions)),
     };
     RuleEntry {
@@ -296,16 +628,17 @@ fn toml_str(s: &str) -> String {
     toml::Value::String(s.to_owned()).to_string()
 }
 
+/// `key = [...]` with already rendered TOML items, one per line when there are several.
 fn toml_array(items: &[String], out: &mut String, key: &str) {
     match items {
         [] => {}
         [one] => {
-            let _ = writeln!(out, "{key} = [{}]", toml_str(one));
+            let _ = writeln!(out, "{key} = [{one}]");
         }
         many => {
             let _ = writeln!(out, "{key} = [");
             for item in many {
-                let _ = writeln!(out, "  {},", toml_str(item));
+                let _ = writeln!(out, "  {item},");
             }
             out.push_str("]\n");
         }
@@ -344,18 +677,22 @@ pub fn export(rules: &[Rule]) -> String {
         if let Some(json) = &entry.condition_json {
             toml_json("condition_json", json, &mut out);
         } else {
-            let mode = if entry.mode == MatchMode::All {
-                "all"
-            } else {
-                "any"
-            };
-            let _ = writeln!(out, "match = \"{mode}\"");
-            toml_array(&entry.when, &mut out, "when");
+            if entry.when.len() > 1 {
+                let mode = if entry.mode == MatchMode::All {
+                    "all"
+                } else {
+                    "any"
+                };
+                let _ = writeln!(out, "match = \"{mode}\"");
+            }
+            let rows: Vec<String> = entry.when.iter().map(When::toml).collect();
+            toml_array(&rows, &mut out, "when");
         }
         if let Some(json) = &entry.actions_json {
             toml_json("actions_json", json, &mut out);
         } else {
-            toml_array(&entry.then, &mut out, "then");
+            let rows: Vec<String> = entry.then.iter().map(Then::toml).collect();
+            toml_array(&rows, &mut out, "then");
             let _ = writeln!(out, "stop = {}", entry.stop.unwrap_or(true));
         }
     }
@@ -364,7 +701,14 @@ pub fn export(rules: &[Rule]) -> String {
 
 /// Parses a rules file into the rules it asks for.
 pub fn parse(text: &str) -> Result<Vec<DesiredRule>> {
-    let file: RuleFile = toml::from_str(text).map_err(|e| Error::RuleFile(e.to_string()))?;
+    let file: RuleFile = toml::from_str(text).map_err(|e| {
+        let hint = if uses_v1_strings(text) {
+            "\nthis looks like a rules file from before v2 (rows as strings like \"from contains x\"); re-export it"
+        } else {
+            ""
+        };
+        Error::RuleFile(format!("{e}{hint}"))
+    })?;
     file.rule
         .into_iter()
         .enumerate()
@@ -372,6 +716,26 @@ pub fn parse(text: &str) -> Result<Vec<DesiredRule>> {
             build(entry).map_err(|e| Error::RuleFile(format!("rule #{}: {e}", i + 1)))
         })
         .collect()
+}
+
+/// v1 wrote rows as strings with blanks (`"from contains x"`); v2 only has blank-free bare strings.
+fn uses_v1_strings(text: &str) -> bool {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return false;
+    };
+    let Some(rules) = table.get("rule").and_then(toml::Value::as_array) else {
+        return false;
+    };
+    rules.iter().any(|r| {
+        ["when", "then"].iter().any(|k| {
+            r.get(k)
+                .and_then(toml::Value::as_array)
+                .is_some_and(|rows| {
+                    rows.iter()
+                        .any(|x| x.as_str().is_some_and(|s| s.contains(char::is_whitespace)))
+                })
+        })
+    })
 }
 
 fn build(entry: RuleEntry) -> std::result::Result<DesiredRule, String> {
@@ -387,15 +751,11 @@ fn build(entry: RuleEntry) -> std::result::Result<DesiredRule, String> {
                 let compact = compact(json).map_err(|e| ctx("condition_json", &e))?;
                 (value, Vec::new(), Some(compact))
             }
-            (None, true) => return Err(ctx("condition", &"needs at least one `when` line")),
+            (None, true) => return Err(ctx("condition", &"needs at least one `when` row")),
             (None, false) => {
-                let tests = entry
-                    .when
-                    .iter()
-                    .map(|s| s.parse::<Test>().map_err(|e| ctx("when", &e)))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let tests: Vec<Test> = entry.when.iter().map(When::test).collect();
                 let built = condition(entry.mode.into(), &tests).map_err(|e| ctx("when", &e))?;
-                (built, tests.iter().map(Test::to_string).collect(), None)
+                (built, entry.when.clone(), None)
             }
         };
     let (actions_list, canon_then, canon_stop, canon_actions_json) =
@@ -410,16 +770,11 @@ fn build(entry: RuleEntry) -> std::result::Result<DesiredRule, String> {
                 let compact = compact(json).map_err(|e| ctx("actions_json", &e))?;
                 (list, Vec::new(), None, Some(compact))
             }
-            (None, true) => return Err(ctx("actions", &"needs at least one `then` line")),
+            (None, true) => return Err(ctx("actions", &"needs at least one `then` row")),
             (None, false) => {
-                let effects = entry
-                    .then
-                    .iter()
-                    .map(|s| s.parse::<Effect>().map_err(|e| ctx("then", &e)))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let effects: Vec<Effect> = entry.then.iter().map(Then::effect).collect();
                 let stop = entry.stop.unwrap_or(true);
-                let canon: Vec<String> = effects.iter().map(Effect::to_string).collect();
-                (actions(effects, stop), canon, Some(stop), None)
+                (actions(effects, stop), entry.then.clone(), Some(stop), None)
             }
         };
     let canon_when_len = canon_when.len();
@@ -427,7 +782,7 @@ fn build(entry: RuleEntry) -> std::result::Result<DesiredRule, String> {
         id: entry.id.clone(),
         name: entry.name.clone(),
         active: entry.active,
-        // `match` only means something with several `when` lines
+        // `match` only means something with several `when` rows
         mode: if canon_when_len < 2 {
             MatchMode::Any
         } else {
@@ -542,8 +897,12 @@ pub(crate) mod tests {
         let text = export(&fixtures());
         assert!(text.contains("id = \"5\""));
         assert!(text.contains("name = \"club köln\""));
-        assert!(text.contains("\"to-cc contains members@club-koeln.example\""));
-        assert!(text.contains("then = [\"move INBOX/Club Köln\"]"));
+        assert!(text.contains("{ to-cc.contains = \"members@club-koeln.example\" }"));
+        assert!(
+            !text.contains("match = \"any\"\nwhen = [{"),
+            "no `match` for single rows"
+        );
+        assert!(text.contains("then = [{ move = \"INBOX/Club Köln\" }]"));
         assert!(text.contains("active = false"));
         assert!(text.contains("say \"hi\" \\ ünï") || text.contains("say \\\"hi\\\" \\\\ ünï"));
     }
@@ -561,7 +920,7 @@ pub(crate) mod tests {
             assert_eq!(rebuilt.actions, set[i].actions);
         }
         // a plain `to` written by the server with an explicit `includeCcHeader: false` stays readable
-        assert!(text.contains("\"to contains x@y.de\""));
+        assert!(text.contains("{ to.contains = \"x@y.de\" }"));
     }
 
     #[test]
@@ -593,7 +952,7 @@ pub(crate) mod tests {
             a,
             Action::Known(KnownAction::TemplatedEmailNotify { pending: true, .. })
         )));
-        let edited = text.replace("forward a@b.de", "forward new@b.de");
+        let edited = text.replace("forward = \"a@b.de\"", "forward = \"new@b.de\"");
         let rule = parse(&edited).unwrap()[3].to_rule(Some(&set[3]));
         assert!(rule.actions.iter().any(|a| matches!(a, Action::Known(KnownAction::CopyForward { pending: true, receivers }) if receivers == &["new@b.de"])));
     }
@@ -601,22 +960,50 @@ pub(crate) mod tests {
     #[test]
     fn spelling_variants_are_not_changes() {
         let set = fixtures();
-        let text = export(&set)
-            .replacen(
-                "\"from contains confluence",
-                "\"from   contains confluence",
-                1,
-            )
-            .replacen("match = \"any\"", "match = \"all\"", 1);
+        // a single row with a meaningless `match`, and the table written differently
+        let text = export(&set).replacen(
+            "when = [{ from.contains = \"wiki@club-koeln.example\" }]",
+            "match = \"all\"\nwhen = [ {from = {contains=\"wiki@club-koeln.example\"}} ]",
+            1,
+        );
         let d = parse(&text).unwrap();
         assert!(d[0].same_as(&set[0]), "{:?}", d[0].changes(&set[0]));
+        // sizes in any unit
+        let size = |s: &str| {
+            format!("[[rule]]\nname = \"n\"\nwhen = [{{ size.gt = {s} }}]\nthen = [\"read\"]\n")
+        };
+        let rule = |t: &str| parse(t).unwrap()[0].to_rule(None);
+        assert_eq!(rule(&size("\"5MB\"")), rule(&size("5242880")));
+        assert_eq!(rule(&size("\"5120KB\"")), rule(&size("\"5mb\"")));
+    }
+
+    #[test]
+    fn values_are_kept_exactly() {
+        let mut set = fixtures();
+        let Condition::Known(KnownCondition::MultiSubjectComparator {
+            header_comparator_conditions,
+            ..
+        }) = &mut set[4].condition
+        else {
+            unreachable!()
+        };
+        header_comparator_conditions[0] = serde_json::from_value(
+            json!({"type": "Subject", "comparator": "STARTS_WITH", "inverted": false, "comparand": "  [x] \"q\" \\ "}),
+        )
+        .unwrap();
+        let text = export(&set);
+        assert!(!text.contains("condition_json ="), "{text}");
+        let d = parse(&text).unwrap();
+        assert!(d[4].same_as(&set[4]));
+        assert_eq!(d[4].to_rule(Some(&set[4])).condition, set[4].condition);
     }
 
     #[test]
     fn new_rules_get_defaults() {
-        let d =
-            parse("[[rule]]\nname = \"n\"\nwhen = [\"subject contains x\"]\nthen = [\"read\"]\n")
-                .unwrap();
+        let d = parse(
+            "[[rule]]\nname = \"n\"\nwhen = [{ subject.contains = \"x\" }]\nthen = [\"read\"]\n",
+        )
+        .unwrap();
         let rule = d[0].to_rule(None);
         assert!(rule.active && rule.rule_id.is_none() && rule.consider_stopped);
         assert_eq!(rule.actions.last(), Some(&Action::Known(KnownAction::Stop)));
@@ -625,19 +1012,31 @@ pub(crate) mod tests {
     #[test]
     fn mistakes_are_reported_with_context() {
         let bad = |t: &str| parse(t).unwrap_err().to_string();
+        let rule = |when: &str, then: &str| {
+            format!("[[rule]]\nname = \"x\"\nwhen = [{when}]\nthen = [{then}]\n")
+        };
         assert!(
             bad("[[rule]]\nname = \"x\"\nwhn = []\n").contains("whn"),
             "typos are rejected"
         );
+
+        let e = bad(&rule("{ subject.wobbles = \"y\" }", "\"read\""));
         assert!(
-            bad("[[rule]]\nname = \"x\"\nwhen = [\"from contains\"]\nthen = [\"read\"]\n")
-                .contains("rule #1")
-        );
-        let e = bad("[[rule]]\nname = \"x\"\nwhen = [\"subject wobbles y\"]\nthen = [\"read\"]\n");
-        assert!(
-            e.contains("\"x\"") && e.contains("subject wobbles y"),
+            e.contains("line 3") && e.contains("wobbles") && e.contains("starts-with"),
             "{e}"
         );
+        let e = bad(&rule("{ sender.contains = \"y\" }", "\"read\""));
+        assert!(
+            e.contains("sender") && e.contains("from"),
+            "unknown fields list the valid ones: {e}"
+        );
+        let e = bad(&rule("{ size.gt = \"big\" }", "\"read\""));
+        assert!(e.contains("\"big\" is not a size"), "{e}");
+        let e = bad(&rule("{ priority.is = \"urgent\" }", "\"read\""));
+        assert!(e.contains("urgent") && e.contains("normal"), "{e}");
+        let e = bad(&rule("\"all-new\"", "{ move = 3 }"));
+        assert!(e.contains("line 4"), "{e}");
+
         assert!(bad("[[rule]]\nname = \"x\"\nwhen = [\"all-new\"]\n").contains("`then`"));
         assert!(bad("[[rule]]\nname = \"x\"\nthen = [\"read\"]\n").contains("`when`"));
         assert!(
@@ -654,6 +1053,23 @@ pub(crate) mod tests {
                 "[[rule]]\nname = \"x\"\nwhen = [\"all-new\"]\nactions_json = '[]'\nstop = false\n"
             )
             .contains("actions_json")
+        );
+    }
+
+    #[test]
+    fn v1_files_get_a_re_export_hint() {
+        let e = parse(
+            "[[rule]]\nname = \"x\"\nwhen = [\"from contains a\"]\nthen = [\"move INBOX/A\"]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("before v2") && e.contains("re-export"), "{e}");
+        let e = parse("[[rule]]\nname = \"x\"\nwhen = [\"al-new\"]\nthen = [\"read\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !e.contains("before v2"),
+            "a plain typo is not mistaken for v1: {e}"
         );
     }
 }

@@ -342,7 +342,9 @@ mod tests {
 
     #[test]
     fn unknown_folders_are_errors_only_when_folders_are_known() {
-        let t = rule("when = [\"all-new\"]\nthen = [\"move INBOX/Nope\", \"copy INBOX/Yes\"]");
+        let t = rule(
+            "when = [\"all-new\"]\nthen = [{ move = \"INBOX/Nope\" }, { copy = \"INBOX/Yes\" }]",
+        );
         assert!(lint(&t, None).is_empty());
         let d = lint(&t, Some(&folders(&["INBOX/Yes"])));
         assert_eq!(
@@ -355,7 +357,9 @@ mod tests {
     #[test]
     fn addresses_sizes_and_names_are_validated() {
         let d = lint(
-            &rule("when = [\"size gt 0\"]\nthen = [\"forward not-an-address\", \"notify a@b\"]"),
+            &rule(
+                "when = [{ size.gt = 0 }]\nthen = [{ forward = \"not-an-address\" }, { notify = \"a@b\" }]",
+            ),
             None,
         );
         let errors = messages(&d, Severity::Error);
@@ -381,7 +385,7 @@ mod tests {
     fn duplicate_names_and_ids() {
         let two = |a: &str, b: &str| {
             format!(
-                "[[rule]]\n{a}name = \"same\"\nwhen = [\"subject contains x\"]\nthen = [\"read\"]\n\n[[rule]]\n{b}name = \"same\"\nwhen = [\"subject contains y\"]\nthen = [\"read\"]\n"
+                "[[rule]]\n{a}name = \"same\"\nwhen = [{{ subject.contains = \"x\" }}]\nthen = [\"read\"]\n\n[[rule]]\n{b}name = \"same\"\nwhen = [{{ subject.contains = \"y\" }}]\nthen = [\"read\"]\n"
             )
         };
         let d = lint(&two("", ""), None);
@@ -399,17 +403,17 @@ mod tests {
 
     #[test]
     fn shadowed_and_duplicate_rules() {
-        let a = "[[rule]]\nname = \"catch\"\nwhen = [\"all-new\"]\nthen = [\"move INBOX/A\"]\n\n";
-        let b =
-            "[[rule]]\nname = \"late\"\nwhen = [\"from contains x\"]\nthen = [\"move INBOX/B\"]\n";
+        let a =
+            "[[rule]]\nname = \"catch\"\nwhen = [\"all-new\"]\nthen = [{ move = \"INBOX/A\" }]\n\n";
+        let b = "[[rule]]\nname = \"late\"\nwhen = [{ from.contains = \"x\" }]\nthen = [{ move = \"INBOX/B\" }]\n";
         let d = lint(&format!("{a}{b}"), None);
         assert_eq!(d[0].rule, 2);
         assert!(
             d[0].message.contains("never reached") && d[0].message.contains("matches all new mail")
         );
-        let same = "[[rule]]\nname = \"one\"\nwhen = [\"from contains x\"]\nthen = [\"move INBOX/A\"]\nstop = false\n\n[[rule]]\nname = \"two\"\nwhen = [\"from contains x\"]\nthen = [\"move INBOX/A\"]\nstop = false\n";
+        let same = "[[rule]]\nname = \"one\"\nwhen = [{ from.contains = \"x\" }]\nthen = [{ move = \"INBOX/A\" }]\nstop = false\n\n[[rule]]\nname = \"two\"\nwhen = [{ from.contains = \"x\" }]\nthen = [{ move = \"INBOX/A\" }]\nstop = false\n";
         assert!(lint(same, None)[0].message.contains("duplicates rule #1"));
-        let same_condition = "[[rule]]\nname = \"one\"\nwhen = [\"from contains x\"]\nthen = [\"read\"]\n\n[[rule]]\nname = \"two\"\nwhen = [\"from contains x\"]\nthen = [\"delete\"]\n";
+        let same_condition = "[[rule]]\nname = \"one\"\nwhen = [{ from.contains = \"x\" }]\nthen = [\"read\"]\n\n[[rule]]\nname = \"two\"\nwhen = [{ from.contains = \"x\" }]\nthen = [\"delete\"]\n";
         assert!(
             lint(same_condition, None)[0]
                 .message
@@ -427,7 +431,7 @@ mod tests {
     fn suspicious_but_legal_rules_get_warnings() {
         let d = lint(
             &rule(
-                "when = [\"from contains .*@spam.com\"]\nthen = [\"move INBOX\", \"copy INBOX/A\", \"move INBOX/A\", \"delete\"]",
+                "when = [{ from.contains = \".*@spam.com\" }]\nthen = [{ move = \"INBOX\" }, { copy = \"INBOX/A\" }, { move = \"INBOX/A\" }, \"delete\"]",
             ),
             None,
         );
@@ -443,7 +447,9 @@ mod tests {
 
     #[test]
     fn forward_targets_needing_confirmation_are_noted_once_known() {
-        let t = rule("when = [\"all-new\"]\nthen = [\"forward a@b.de\", \"notify c@d.de\"]");
+        let t = rule(
+            "when = [\"all-new\"]\nthen = [{ forward = \"a@b.de\" }, { notify = \"c@d.de\" }]",
+        );
         let notes = messages(&lint(&t, None), Severity::Note).join("|");
         assert!(notes.contains("forward target a@b.de"));
         assert!(
@@ -456,7 +462,7 @@ mod tests {
         existing.actions = serde_json::from_value(serde_json::json!([
             {"type": "CopyForward", "pending": false, "receivers": ["a@b.de"]}, {"type": "Stop"}]))
         .unwrap();
-        let t = rule("when = [\"all-new\"]\nthen = [\"forward a@b.de\"]");
+        let t = rule("when = [\"all-new\"]\nthen = [{ forward = \"a@b.de\" }]");
         assert!(
             check(&parse(&t).unwrap(), None, &[existing]).is_empty(),
             "a confirmed target is not noted again"

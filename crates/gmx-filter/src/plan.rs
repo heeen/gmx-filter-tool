@@ -434,8 +434,7 @@ mod tests {
     #[test]
     fn new_rules_append_without_reorder_unless_placed_earlier() {
         let remote = fixtures();
-        let new =
-            "\n[[rule]]\nname = \"new\"\nwhen = [\"subject contains n\"]\nthen = [\"read\"]\n";
+        let new = "\n[[rule]]\nname = \"new\"\nwhen = [{ subject.contains = \"n\" }]\nthen = [\"read\"]\n";
         let at_end = plan(&remote, &format!("{}{new}", export(&remote)), false).unwrap();
         assert_eq!(kinds(&at_end), ["create"]);
         assert!(at_end.render().contains("+ create   \"new\""));
@@ -572,7 +571,7 @@ mod tests {
         after[3].rule_name = "social".into();
         after[3].active = true;
         let mut created = desired(
-            "[[rule]]\nname = \"new\"\nwhen = [\"subject contains n\"]\nthen = [\"read\"]\n",
+            "[[rule]]\nname = \"new\"\nwhen = [{ subject.contains = \"n\" }]\nthen = [\"read\"]\n",
         )[0]
         .to_rule(None);
         created.rule_id = Some("11".into());
