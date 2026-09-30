@@ -42,6 +42,8 @@ pub enum Error {
     Drift(String),
     #[error("rules file: {0}")]
     RuleFile(String),
+    #[error("sieve file: {0}")]
+    Sieve(String),
     #[error("invalid rule spec: {0}")]
     InvalidSpec(String),
     #[error("rule has no ruleId; use a rule returned by list_rules")]

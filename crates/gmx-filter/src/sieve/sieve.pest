@@ -1,0 +1,26 @@
+// The generic syntax of RFC 5228 section 8. What each command and test means (and whether GMX can
+// store it) is decided when lowering, so unsupported constructs get a precise message.
+
+file      = { SOI ~ command* ~ EOI }
+command   = { identifier ~ argument* ~ (test_list | test)? ~ (";" | block) }
+block     = { "{" ~ command* ~ "}" }
+test      = { identifier ~ argument* ~ (test_list | test)? }
+test_list = { "(" ~ test ~ ("," ~ test)* ~ ")" }
+
+argument    = _{ string_list | string | number | tag }
+string_list =  { "[" ~ string ~ ("," ~ string)* ~ "]" }
+string      = _{ multi_line | quoted }
+number      = @{ ASCII_DIGIT+ ~ (^"k" | ^"m" | ^"g")? }
+tag         = ${ ":" ~ identifier }
+identifier  = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+quoted     = ${ "\"" ~ quoted_raw ~ "\"" }
+quoted_raw = @{ ((!("\"" | "\\") ~ ANY) | ("\\" ~ ANY))* }
+multi_line = ${ ^"text:" ~ (" " | "\t")* ~ hash_comment? ~ NEWLINE ~ ml_body ~ "." ~ (NEWLINE | EOI) }
+ml_body    = @{ (!("." ~ (NEWLINE | EOI)) ~ (!NEWLINE ~ ANY)* ~ NEWLINE)* }
+
+WHITESPACE      = _{ " " | "\t" | NEWLINE }
+// Not silent: hash comments before a command carry the rule's name and id.
+COMMENT         =  { hash_comment | bracket_comment }
+hash_comment    = @{ "#" ~ (!NEWLINE ~ ANY)* }
+bracket_comment = @{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }

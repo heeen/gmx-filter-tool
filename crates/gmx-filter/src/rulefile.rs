@@ -524,6 +524,29 @@ fn show_then(rows: &[Then]) -> String {
 }
 
 impl DesiredRule {
+    /// A rule built by another front end (the Sieve file); compared through the same normal form as
+    /// server rules, however it was spelled.
+    pub(crate) fn from_parts(
+        id: Option<String>,
+        name: String,
+        active: bool,
+        condition: Condition,
+        actions: Vec<Action>,
+    ) -> Self {
+        let mut rule = Rule::new(&name, condition, actions);
+        rule.active = active;
+        let mut canon = entry_of(&rule);
+        canon.id.clone_from(&id);
+        Self {
+            id,
+            name,
+            active,
+            condition: rule.condition,
+            actions: rule.actions,
+            canon,
+        }
+    }
+
     /// One line for previews, in the `--when` / `--then` wording.
     pub fn summary(&self) -> String {
         let c = &self.canon;
@@ -1033,7 +1056,7 @@ pub(crate) mod tests {
         ]))
     }
 
-    fn odd() -> Vec<Rule> {
+    pub(crate) fn odd() -> Vec<Rule> {
         rules(json!([
             {"type": TYPE, "ruleId": "9", "ruleName": "odd", "active": true, "considerStopped": true,
              "condition": {"type": "Brand new", "x": [1, 2]},
@@ -1086,6 +1109,20 @@ pub(crate) mod tests {
         assert!(text.contains("then = [{ move = \"INBOX/Club Köln\" }]"));
         assert!(text.contains("active = false"));
         assert!(text.contains("say \"hi\" \\ ünï") || text.contains("say \\\"hi\\\" \\\\ ünï"));
+    }
+
+    #[test]
+    fn a_rule_from_parts_is_the_same_as_its_source() {
+        for r in fixtures().into_iter().chain(odd()) {
+            let d = DesiredRule::from_parts(
+                r.rule_id.clone(),
+                r.rule_name.clone(),
+                r.active,
+                r.condition.clone(),
+                r.actions.clone(),
+            );
+            assert!(d.same_as(&r), "{}: {:?}", r.rule_name, d.changes(&r));
+        }
     }
 
     #[test]
