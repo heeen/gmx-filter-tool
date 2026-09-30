@@ -116,6 +116,16 @@ pub fn check(
         }
 
         if let Some((_, tests)) = tests_of(&d.condition) {
+            for (k, t) in tests.iter().enumerate() {
+                if tests[..k].contains(t) {
+                    push(
+                        i,
+                        d,
+                        Severity::Warning,
+                        format!("the condition `{t}` is listed twice"),
+                    );
+                }
+            }
             for t in &tests {
                 match t {
                     Test::Size { bytes: 0, .. } => push(
@@ -424,6 +434,18 @@ mod tests {
             lint(&format!("{inactive}{b}"), None)
                 .iter()
                 .all(|d| d.severity != Severity::Warning)
+        );
+    }
+
+    #[test]
+    fn repeated_conditions_are_flagged() {
+        let d = lint(
+            &rule("from.contains = [\"a\", \"b\", \"a\"]\nthen = [\"read\"]"),
+            None,
+        );
+        assert_eq!(
+            messages(&d, Severity::Warning),
+            ["the condition `from contains a` is listed twice"]
         );
     }
 

@@ -15,7 +15,9 @@ use crate::{
 
 const HEADER: &str = r#"# gmxf rules v2. File order is rule order. A rule is matched to the server by `id`, else by `name`.
 #
-#   match = "any" | "all"   whether one or every `when` row must hold (default "any")
+#   from.contains = "x"     or ["x", "y"]: one row per value. Fields from | to | to-cc | subject, operators
+#                           contains | not-contains | is | is-not | [not-]starts-with | [not-]ends-with
+#   match = "any" | "all"   whether one or every row must hold (default "any")
 #   when  = [ { from.contains = "x" }      from | to | to-cc | subject  .  contains | not-contains | is | is-not
 #             { size.gt = "5MB" }            | starts-with | not-starts-with | ends-with | not-ends-with
 #             { priority.is = "high" }     size . gt | lt  ("500KB", "5MB" or bytes);  priority . is | is-not
@@ -53,7 +55,7 @@ impl From<Mode> for MatchMode {
 }
 
 /// One condition row: `{ <field>.<op> = <value> }` or a bare string for value-less rows.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 enum When {
     AllNew,
@@ -66,7 +68,7 @@ enum When {
     Contact(Contact),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 enum HeaderOp {
     Contains(String),
@@ -79,7 +81,7 @@ enum HeaderOp {
     NotEndsWith(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 enum SizeOp {
     Gt(Bytes),
@@ -87,7 +89,7 @@ enum SizeOp {
 }
 
 /// A byte count, written as `"5MB"`, `"300KB"`, `"120B"` or a plain integer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Bytes(u64);
 
 impl<'de> Deserialize<'de> for Bytes {
@@ -107,14 +109,14 @@ impl<'de> Deserialize<'de> for Bytes {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 enum PriorityOp {
     Is(Level),
     IsNot(Level),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 enum Level {
     Low,
@@ -122,12 +124,93 @@ enum Level {
     High,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 enum Contact {
     Saved,
     NotSaved,
 }
+
+/// `"x"` or `["x", "y"]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Values(Vec<String>);
+
+impl<'de> Deserialize<'de> for Values {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Values;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string or an array of strings")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Values, E> {
+                Ok(Values(vec![v.to_owned()]))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Values, A::Error> {
+                let mut out = Vec::new();
+                while let Some(v) = seq.next_element::<String>()? {
+                    out.push(v);
+                }
+                if out.is_empty() {
+                    return Err(A::Error::custom(
+                        "the list is empty; remove the key instead",
+                    ));
+                }
+                Ok(Values(out))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Builds a condition row for one header field.
+type Field = fn(HeaderOp) -> When;
+/// Builds a header operation from its value.
+type OpFn = fn(String) -> HeaderOp;
+
+/// `from.contains = ...` and friends directly in a rule: one row per value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct HeaderGroup {
+    contains: Option<Values>,
+    not_contains: Option<Values>,
+    is: Option<Values>,
+    is_not: Option<Values>,
+    starts_with: Option<Values>,
+    not_starts_with: Option<Values>,
+    ends_with: Option<Values>,
+    not_ends_with: Option<Values>,
+}
+
+impl HeaderGroup {
+    fn rows(&self, field: Field) -> Vec<When> {
+        let ops: [(&Option<Values>, OpFn); 8] = [
+            (&self.contains, HeaderOp::Contains),
+            (&self.not_contains, HeaderOp::NotContains),
+            (&self.is, HeaderOp::Is),
+            (&self.is_not, HeaderOp::IsNot),
+            (&self.starts_with, HeaderOp::StartsWith),
+            (&self.not_starts_with, HeaderOp::NotStartsWith),
+            (&self.ends_with, HeaderOp::EndsWith),
+            (&self.not_ends_with, HeaderOp::NotEndsWith),
+        ];
+        ops.into_iter()
+            .flat_map(|(values, op)| values.iter().flat_map(|v| v.0.clone()).map(op))
+            .map(field)
+            .collect()
+    }
+}
+
+/// Header fields in the order the grouped form is written.
+const GROUPS: [(&str, Field); 4] = [
+    ("from", When::From),
+    ("to", When::To),
+    ("to-cc", When::ToCc),
+    ("subject", When::Subject),
+];
 
 /// One action row: `{ <action> = <target> }` or a bare string for target-less actions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -376,6 +459,14 @@ struct RuleEntry {
     #[serde(default, rename = "match")]
     mode: MatchMode,
     #[serde(default)]
+    from: Option<HeaderGroup>,
+    #[serde(default)]
+    to: Option<HeaderGroup>,
+    #[serde(default, rename = "to-cc")]
+    to_cc: Option<HeaderGroup>,
+    #[serde(default)]
+    subject: Option<HeaderGroup>,
+    #[serde(default)]
     when: Vec<When>,
     #[serde(default)]
     then: Vec<Then>,
@@ -404,6 +495,18 @@ pub struct DesiredRule {
     pub actions: Vec<Action>,
     /// Normalized form, comparable with [`entry_of`] of a server rule.
     canon: RuleEntry,
+}
+
+/// Row order does not change what a rule matches ("any" or "all" of them).
+fn sorted_rows(rows: &[When]) -> Vec<When> {
+    let mut rows = rows.to_vec();
+    rows.sort();
+    rows
+}
+
+fn sorted(mut entry: RuleEntry) -> RuleEntry {
+    entry.when.sort();
+    entry
 }
 
 fn show_when(rows: &[When], sep: &str) -> String {
@@ -449,7 +552,7 @@ impl DesiredRule {
     pub fn same_as(&self, remote: &Rule) -> bool {
         let mut theirs = entry_of(remote);
         theirs.id = self.canon.id.clone();
-        theirs == self.canon
+        sorted(theirs) == sorted(self.canon.clone())
     }
 
     /// Differences to `remote`, for display: `(field, before, after)`.
@@ -469,11 +572,12 @@ impl DesiredRule {
             format!("{:?}", theirs.mode),
             format!("{:?}", ours.mode),
         );
-        diff(
-            "when",
-            show_when(&theirs.when, "; "),
-            show_when(&ours.when, "; "),
-        );
+        let (before, after) = if sorted_rows(&theirs.when) == sorted_rows(&ours.when) {
+            (String::new(), String::new())
+        } else {
+            (show_when(&theirs.when, "; "), show_when(&ours.when, "; "))
+        };
+        diff("when", before, after);
         diff("then", show_then(&theirs.then), show_then(&ours.then));
         diff(
             "stop",
@@ -579,6 +683,10 @@ fn entry_of(rule: &Rule) -> RuleEntry {
         name: rule.rule_name.clone(),
         active: rule.active,
         mode,
+        from: None,
+        to: None,
+        to_cc: None,
+        subject: None,
         when,
         then,
         stop,
@@ -656,6 +764,51 @@ fn toml_json(key: &str, json: &str, out: &mut String) {
     }
 }
 
+/// Header rows as `field.op = values` keys, the rest as `when = [...]`.
+fn write_grouped(rows: &[When], out: &mut String) {
+    for (field, variant) in GROUPS {
+        let mut by_op: Vec<(&'static str, Vec<&str>)> = Vec::new();
+        for row in rows {
+            let op = match (row, variant(HeaderOp::Is(String::new()))) {
+                (When::From(op), When::From(_))
+                | (When::To(op), When::To(_))
+                | (When::ToCc(op), When::ToCc(_))
+                | (When::Subject(op), When::Subject(_)) => op,
+                _ => continue,
+            };
+            let (name, _, _, value) = op.parts();
+            match by_op.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, values)) => values.push(value),
+                None => by_op.push((name, vec![value])),
+            }
+        }
+        for (op, values) in by_op {
+            let key = format!("{field}.{op}");
+            let items: Vec<String> = values.iter().map(|v| toml_str(v)).collect();
+            match &items[..] {
+                [one] => {
+                    let _ = writeln!(out, "{key} = {one}");
+                }
+                many if key.len() + many.iter().map(|i| i.len() + 2).sum::<usize>() <= 96 => {
+                    let _ = writeln!(out, "{key} = [{}]", many.join(", "));
+                }
+                many => toml_array(many, out, &key),
+            }
+        }
+    }
+    let rest: Vec<String> = rows
+        .iter()
+        .filter(|r| {
+            !matches!(
+                r,
+                When::From(_) | When::To(_) | When::ToCc(_) | When::Subject(_)
+            )
+        })
+        .map(When::toml)
+        .collect();
+    toml_array(&rest, out, "when");
+}
+
 /// Renders the rules as a rules file.
 pub fn export(rules: &[Rule]) -> String {
     let mut out = String::from(HEADER);
@@ -685,8 +838,7 @@ pub fn export(rules: &[Rule]) -> String {
                 };
                 let _ = writeln!(out, "match = \"{mode}\"");
             }
-            let rows: Vec<String> = entry.when.iter().map(When::toml).collect();
-            toml_array(&rows, &mut out, "when");
+            write_grouped(&entry.when, &mut out);
         }
         if let Some(json) = &entry.actions_json {
             toml_json("actions_json", json, &mut out);
@@ -738,26 +890,49 @@ fn uses_v1_strings(text: &str) -> bool {
     })
 }
 
-fn build(entry: RuleEntry) -> std::result::Result<DesiredRule, String> {
+fn build(mut entry: RuleEntry) -> std::result::Result<DesiredRule, String> {
+    let groups = [
+        (&entry.from, When::From as Field),
+        (&entry.to, When::To),
+        (&entry.to_cc, When::ToCc),
+        (&entry.subject, When::Subject),
+    ];
+    let mut rows: Vec<When> = groups
+        .iter()
+        .flat_map(|(g, field)| g.iter().flat_map(|g| g.rows(*field)))
+        .collect();
+    rows.append(&mut entry.when);
+    entry.when = rows;
+    (entry.from, entry.to, entry.to_cc, entry.subject) = (None, None, None, None);
     let ctx = |what: &str, e: &dyn std::fmt::Display| format!("{:?}: {what}: {e}", entry.name);
-    let (condition, canon_when, canon_cond_json) =
-        match (&entry.condition_json, entry.when.is_empty()) {
-            (Some(_), false) => {
-                return Err(ctx("condition", &"use either `when` or `condition_json`"));
-            }
-            (Some(json), true) => {
-                let value: Condition =
-                    serde_json::from_str(json).map_err(|e| ctx("condition_json", &e))?;
-                let compact = compact(json).map_err(|e| ctx("condition_json", &e))?;
-                (value, Vec::new(), Some(compact))
-            }
-            (None, true) => return Err(ctx("condition", &"needs at least one `when` row")),
-            (None, false) => {
-                let tests: Vec<Test> = entry.when.iter().map(When::test).collect();
-                let built = condition(entry.mode.into(), &tests).map_err(|e| ctx("when", &e))?;
-                (built, entry.when.clone(), None)
-            }
-        };
+    let (condition, canon_when, canon_cond_json) = match (
+        &entry.condition_json,
+        entry.when.is_empty(),
+    ) {
+        (Some(_), false) => {
+            return Err(ctx(
+                "condition",
+                &"use either condition rows or `condition_json`",
+            ));
+        }
+        (Some(json), true) => {
+            let value: Condition =
+                serde_json::from_str(json).map_err(|e| ctx("condition_json", &e))?;
+            let compact = compact(json).map_err(|e| ctx("condition_json", &e))?;
+            (value, Vec::new(), Some(compact))
+        }
+        (None, true) => {
+            return Err(ctx(
+                "condition",
+                &"needs at least one condition (e.g. `from.contains = \"x\"` or `when = [...]`)",
+            ));
+        }
+        (None, false) => {
+            let tests: Vec<Test> = entry.when.iter().map(When::test).collect();
+            let built = condition(entry.mode.into(), &tests).map_err(|e| ctx("when", &e))?;
+            (built, entry.when.clone(), None)
+        }
+    };
     let (actions_list, canon_then, canon_stop, canon_actions_json) =
         match (&entry.actions_json, entry.then.is_empty()) {
             (Some(_), false) => return Err(ctx("actions", &"use either `then` or `actions_json`")),
@@ -788,6 +963,10 @@ fn build(entry: RuleEntry) -> std::result::Result<DesiredRule, String> {
         } else {
             entry.mode
         },
+        from: None,
+        to: None,
+        to_cc: None,
+        subject: None,
         when: canon_when,
         then: canon_then,
         stop: canon_stop,
@@ -897,7 +1076,9 @@ pub(crate) mod tests {
         let text = export(&fixtures());
         assert!(text.contains("id = \"5\""));
         assert!(text.contains("name = \"club köln\""));
-        assert!(text.contains("{ to-cc.contains = \"members@club-koeln.example\" }"));
+        assert!(text.contains(
+            "to-cc.contains = [\"members@club-koeln.example\", \"wiki@club-koeln.example\"]"
+        ));
         assert!(
             !text.contains("match = \"any\"\nwhen = [{"),
             "no `match` for single rows"
@@ -920,7 +1101,7 @@ pub(crate) mod tests {
             assert_eq!(rebuilt.actions, set[i].actions);
         }
         // a plain `to` written by the server with an explicit `includeCcHeader: false` stays readable
-        assert!(text.contains("{ to.contains = \"x@y.de\" }"));
+        assert!(text.contains("\nto.contains = \"x@y.de\"\n"));
     }
 
     #[test]
@@ -1038,7 +1219,10 @@ pub(crate) mod tests {
         assert!(e.contains("line 4"), "{e}");
 
         assert!(bad("[[rule]]\nname = \"x\"\nwhen = [\"all-new\"]\n").contains("`then`"));
-        assert!(bad("[[rule]]\nname = \"x\"\nthen = [\"read\"]\n").contains("`when`"));
+        assert!(
+            bad("[[rule]]\nname = \"x\"\nthen = [\"read\"]\n")
+                .contains("needs at least one condition")
+        );
         assert!(
             bad("[[rule]]\nname = \"x\"\nwhen = [\"all-new\"]\nthen = [\"read\"]\nstop = maybe\n")
                 .contains("line"),
@@ -1071,5 +1255,57 @@ pub(crate) mod tests {
             !e.contains("before v2"),
             "a plain typo is not mistaken for v1: {e}"
         );
+    }
+
+    #[test]
+    fn header_rows_are_written_grouped_and_read_in_either_form() {
+        let text = export(&fixtures());
+        // the 3-row AnyOf of mixed fields: grouped by field, no `when` needed
+        assert!(text.contains("from.contains = \"volunteers@makerspace.example\"\nto-cc.contains = \"volunteers@lists.uni.example\"\nsubject.contains = \"Makerspace-Volunteers\"\n"), "{text}");
+        assert!(
+            !text.contains("when = "),
+            "only header rows in the fixtures: {text}"
+        );
+
+        let grouped = "[[rule]]\nname = \"n\"\nfrom.contains = [\"a\", \"b\"]\nsubject.not-starts-with = \"Re:\"\nwhen = [{ size.gt = \"1MB\" }]\nthen = [\"read\"]\n";
+        let rows = "[[rule]]\nname = \"n\"\nwhen = [{ subject.not-starts-with = \"Re:\" }, { size.gt = \"1MB\" }, { from.contains = \"b\" }, { from.contains = \"a\" }]\nthen = [\"read\"]\n";
+        let a = parse(grouped).unwrap();
+        let b = parse(rows).unwrap();
+        let built = a[0].to_rule(None);
+        assert!(
+            b[0].same_as(&built),
+            "row order does not matter: {:?}",
+            b[0].changes(&built)
+        );
+
+        // long groups go one per line, short ones stay on one line
+        let long: Vec<String> = (0..8)
+            .map(|i| format!("\"sender-number-{i}@example.com\""))
+            .collect();
+        let many = format!(
+            "[[rule]]\nname = \"n\"\nfrom.contains = [{}]\nthen = [\"read\"]\n",
+            long.join(", ")
+        );
+        let out = export(&[parse(&many).unwrap()[0].to_rule(None)]);
+        assert!(
+            out.contains("from.contains = [\n  \"sender-number-0@example.com\",\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn group_mistakes_are_reported() {
+        let bad = |t: &str| parse(t).unwrap_err().to_string();
+        let e = bad("[[rule]]\nname = \"x\"\nfrom.wobbles = \"a\"\nthen = [\"read\"]\n");
+        assert!(
+            e.contains("wobbles") && e.contains("not-ends-with") && e.contains("line 3"),
+            "{e}"
+        );
+        let e = bad("[[rule]]\nname = \"x\"\nfrom.contains = []\nthen = [\"read\"]\n");
+        assert!(e.contains("empty"), "{e}");
+        let e = bad("[[rule]]\nname = \"x\"\nfrom.contains = 3\nthen = [\"read\"]\n");
+        assert!(e.contains("a string or an array of strings"), "{e}");
+        let e = bad("[[rule]]\nname = \"x\"\nsender.contains = \"a\"\nthen = [\"read\"]\n");
+        assert!(e.contains("sender") && e.contains("subject"), "{e}");
     }
 }
