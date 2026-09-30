@@ -90,6 +90,19 @@ struct AppProperties {
 #[serde(rename_all = "camelCase")]
 struct Identification {
     session_id: String,
+    #[serde(default)]
+    next_step: Vec<NextStep>,
+}
+
+/// One of the ways the login flow offers to continue (`PASSWORD`, `WEBAUTHN_START`, …).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NextStep {
+    #[serde(rename = "type")]
+    kind: String,
+    /// The WebAuthn request (`{"publicKey": {…}}`) that comes with `WEBAUTHN_FINISH`.
+    #[cfg(any(feature = "passkey", test))]
+    options_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +110,26 @@ struct Identification {
 struct Authentication {
     flow_state: Option<String>,
     redirect_url: Option<String>,
+    #[cfg(any(feature = "passkey", test))]
+    #[serde(default)]
+    next_step: Vec<NextStep>,
+}
+
+/// Turns a WebAuthn request (`optionsJson`) and the page origin into the credential JSON the login
+/// page would send (`PublicKeyCredential.toJSON()`).
+#[cfg(any(feature = "passkey", test))]
+pub(crate) type SignPasskey<'a> = &'a dyn Fn(&str, &str) -> Result<String>;
+
+/// Whether the flow offers `kind` next. An empty list (older responses) offers everything.
+fn offers(next: &[NextStep], kind: &str) -> bool {
+    next.is_empty() || next.iter().any(|s| s.kind == kind)
+}
+
+/// How to prove the login.
+pub(crate) enum Credential<'a> {
+    Password(&'a SecretString),
+    #[cfg(any(feature = "passkey", test))]
+    Passkey(SignPasskey<'a>),
 }
 
 enum Step {
@@ -110,7 +143,7 @@ pub(crate) fn web_login(
     start_url: &str,
     token_url: &str,
     user: &str,
-    password: &SecretString,
+    credential: Credential<'_>,
 ) -> Result<SecretString> {
     let jar = Arc::new(Jar::default());
     let http = Http::builder()
@@ -160,16 +193,52 @@ pub(crate) fn web_login(
         }),
     )?;
 
-    let auth: Authentication = flow_post(
-        "password",
-        &http,
-        &headers,
-        &format!("{}/authentication/password", service.service_url),
-        &json!({
-            "factorValue": password.expose_secret(),
-            "sessionId": ident.session_id,
-        }),
-    )?;
+    let flow =
+        |step: &'static str, path: &str, body: serde_json::Value| -> Result<Authentication> {
+            flow_post(
+                step,
+                &http,
+                &headers,
+                &format!("{}/{path}", service.service_url),
+                &body,
+            )
+        };
+    let auth = match credential {
+        Credential::Password(_) if !offers(&ident.next_step, "PASSWORD") => {
+            let offered: Vec<&str> = ident.next_step.iter().map(|s| s.kind.as_str()).collect();
+            return Err(Error::LoginIncomplete {
+                flow_state: offered.join(", "),
+            });
+        }
+        Credential::Password(password) => flow(
+            "password",
+            "authentication/password",
+            json!({"factorValue": password.expose_secret(), "sessionId": ident.session_id}),
+        )?,
+        #[cfg(any(feature = "passkey", test))]
+        Credential::Passkey(sign) => {
+            if !offers(&ident.next_step, "WEBAUTHN_START") {
+                return Err(Error::PasskeyNotOffered);
+            }
+            let started = flow(
+                "webauthn-start",
+                "authentication/webauthn-start",
+                json!({"sessionId": ident.session_id}),
+            )?;
+            let options = started
+                .next_step
+                .into_iter()
+                .find(|s| s.kind == "WEBAUTHN_FINISH")
+                .and_then(|s| s.options_json)
+                .ok_or(Error::LoginPage("WEBAUTHN_FINISH optionsJson"))?;
+            let credential = sign(&options, &headers.origin)?;
+            flow(
+                "webauthn-finish",
+                "authentication/webauthn-finish",
+                json!({"factorValue": credential, "sessionId": ident.session_id}),
+            )?
+        }
+    };
     let Some(redirect) = auth.redirect_url else {
         return Err(Error::LoginIncomplete {
             flow_state: auth.flow_state.unwrap_or_default(),

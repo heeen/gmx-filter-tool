@@ -18,6 +18,12 @@ pub enum Error {
     LoginIncomplete { flow_state: String },
     #[error("login page lacks or has a malformed {0}; GMX may have changed the login")]
     LoginPage(&'static str),
+    #[error(
+        "GMX does not offer a passkey login for this account; add a passkey in the GMX security settings first"
+    )]
+    PasskeyNotOffered,
+    #[error("passkey: {0}")]
+    Passkey(String),
     #[error("login ended at an unexpected page: {0}")]
     LoginUnexpectedRedirect(String),
     #[error("login produced no session cookie for the token endpoint")]

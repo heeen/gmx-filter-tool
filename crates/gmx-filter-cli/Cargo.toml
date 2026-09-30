@@ -16,3 +16,7 @@ toml = "1.1.6"
 [[bin]]
 name = "gmxf"
 path = "src/main.rs"
+
+[features]
+# `gmxf login --passkey`: log in with a passkey on a phone (needs Bluetooth).
+passkey = ["gmx-filter/passkey"]

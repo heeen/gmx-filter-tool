@@ -41,6 +41,11 @@ enum Command {
         /// Read password from stdin instead of prompting (for scripts).
         #[arg(long)]
         password_stdin: bool,
+        /// Log in with a passkey on your phone: scan the QR code and approve on the phone. Needs
+        /// Bluetooth on this computer and the phone nearby.
+        #[cfg(feature = "passkey")]
+        #[arg(long, conflicts_with = "password_stdin")]
+        passkey: bool,
     },
     /// Show or change the settings in ~/.config/gmxf/config.toml.
     ///
@@ -196,6 +201,8 @@ fn main() -> Result<()> {
         Command::Login {
             user,
             password_stdin,
+            #[cfg(feature = "passkey")]
+            passkey,
         } => {
             let cfg = Config::load()?;
             let user = match user.or(cfg.email) {
@@ -212,6 +219,12 @@ fn main() -> Result<()> {
                     u
                 }
             };
+            #[cfg(feature = "passkey")]
+            if passkey {
+                gmx_filter::login_with_passkey(&user)?;
+                println!("logged in as {user}");
+                return Ok(());
+            }
             let password = if password_stdin {
                 let mut line = String::new();
                 io::stdin().read_line(&mut line)?;

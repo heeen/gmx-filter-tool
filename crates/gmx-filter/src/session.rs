@@ -1,19 +1,29 @@
 use reqwest::blocking::Client as Http;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::login::{START_URL, TOKEN_URL, web_login};
+use crate::login::{Credential, START_URL, TOKEN_URL, web_login};
 use crate::store::{Config, FileStore, SecretStore};
 use crate::token::{Relogin, SessionTokenSource, mint, run_secret_command};
 use crate::{Error, Result};
 
 /// Web login; stores the session and remembers the email in the config.
 pub fn login(email: &str, password: &SecretString) -> Result<()> {
+    login_as(email, Credential::Password(password))
+}
+
+/// Web login with a passkey: shows a QR code for a phone (Bluetooth nearby) or uses a USB security key.
+#[cfg(feature = "passkey")]
+pub fn login_with_passkey(email: &str) -> Result<()> {
+    login_as(email, Credential::Passkey(&crate::passkey::sign))
+}
+
+fn login_as(email: &str, credential: Credential<'_>) -> Result<()> {
     login_with(
         START_URL,
         TOKEN_URL,
         &FileStore::session()?,
         email,
-        password,
+        credential,
     )?;
     let mut cfg = Config::load()?;
     if cfg.email.as_deref() != Some(email) {
@@ -53,7 +63,13 @@ pub fn stored_token_source() -> Result<SessionTokenSource> {
     let relogin = match (cfg.email, cfg.password_cmd) {
         (Some(email), Some(cmd)) => Some(Box::new(move || {
             let password = password_from_command(&cmd)?;
-            login_with(START_URL, TOKEN_URL, &session, &email, &password)
+            login_with(
+                START_URL,
+                TOKEN_URL,
+                &session,
+                &email,
+                Credential::Password(&password),
+            )
         }) as Relogin),
         _ => None,
     };
@@ -66,9 +82,9 @@ fn login_with(
     token_url: &str,
     store: &impl SecretStore,
     user: &str,
-    password: &SecretString,
+    credential: Credential<'_>,
 ) -> Result<SecretString> {
-    let cookie = web_login(start_url, token_url, user, password)?;
+    let cookie = web_login(start_url, token_url, user, credential)?;
     mint(&Http::new(), token_url, &cookie).map_err(|e| Error::LoginSessionUnusable(Box::new(e)))?;
     store.save(&cookie)?;
     Ok(cookie)
@@ -89,7 +105,7 @@ mod tests {
             &format!("{}/token", s.url()),
             store,
             "me@gmx.de",
-            &SecretString::from("hunter2"),
+            Credential::Password(&SecretString::from("hunter2")),
         )
     }
 
@@ -158,7 +174,11 @@ mod tests {
                 "targetServiceId": "oauth2", "totpLoginErrorUrl": "https://e/",
                 "totpLoginFailedUrl": "https://f/", "keepMeSignedIn": true,
             })))
-            .with_body(json!({"sessionId": "sess", "flowState": "ONGOING"}).to_string())
+            .with_body(
+                json!({"sessionId": "sess", "flowState": "ONGOING",
+                    "nextStep": [{"type": "PASSWORD"}, {"type": "WEBAUTHN_START"}]})
+                .to_string(),
+            )
             .create()
     }
 
@@ -303,6 +323,106 @@ mod tests {
             .to_string();
         assert!(
             err.contains("password command failed") && err.contains("locked"),
+            "{err}"
+        );
+    }
+
+    const OPTIONS: &str =
+        r#"{"publicKey":{"challenge":"Y2hhbA","rpId":"gmx.net","userVerification":"preferred"}}"#;
+
+    #[test]
+    fn passkey_login_signs_the_offered_request_and_finishes_with_it() {
+        let mut s = Server::new();
+        browser_pages(&mut s);
+        identification(&mut s);
+        let redirect = format!("{}/proceed", s.url());
+        let started = s
+            .mock("POST", "/rest/login-flow/authentication/webauthn-start")
+            .match_body(Matcher::PartialJson(json!({"sessionId": "sess"})))
+            .with_body(
+                json!({"flowState": "ONGOING", "nextStep": [
+                    {"type": "PASSWORD"}, {"type": "WEBAUTHN_FINISH", "optionsJson": OPTIONS}]})
+                .to_string(),
+            )
+            .create();
+        let finished = s
+            .mock("POST", "/rest/login-flow/authentication/webauthn-finish")
+            .match_body(Matcher::PartialJson(
+                json!({"sessionId": "sess", "factorValue": "{\"id\":\"cred\"}"}),
+            ))
+            .with_body(json!({"flowState": "SUCCESS", "redirectUrl": redirect}).to_string())
+            .create();
+        let password = s
+            .mock("POST", "/rest/login-flow/authentication/password")
+            .expect(0)
+            .create();
+        redirect_chain(&mut s, "/start/?code=c&state=st");
+        s.mock("POST", "/token")
+            .with_body(json!({"access_token": "at"}).to_string())
+            .create();
+
+        let seen = std::cell::RefCell::new(None);
+        let sign = |options: &str, origin: &str| {
+            *seen.borrow_mut() = Some((options.to_owned(), origin.to_owned()));
+            Ok(r#"{"id":"cred"}"#.to_owned())
+        };
+        let store = MemStore::default();
+        let url = s.url();
+        login_with(
+            &format!("{url}/go"),
+            &format!("{url}/token"),
+            &store,
+            "me@gmx.de",
+            Credential::Passkey(&sign),
+        )
+        .unwrap();
+        started.assert();
+        finished.assert();
+        password.assert();
+        assert_eq!(
+            seen.into_inner(),
+            Some((OPTIONS.to_owned(), url)),
+            "the request and the page origin"
+        );
+        assert_eq!(store.load().unwrap().expose_secret(), "sso=abc");
+    }
+
+    #[test]
+    fn passkey_login_needs_the_offer() {
+        let mut s = Server::new();
+        browser_pages(&mut s);
+        s.mock("POST", "/rest/login-flow/identification")
+            .with_body(json!({"sessionId": "sess", "nextStep": [{"type": "PASSWORD"}]}).to_string())
+            .create();
+        let sign = |_: &str, _: &str| -> Result<String> { unreachable!("nothing to sign") };
+        let url = s.url();
+        let err = login_with(
+            &format!("{url}/go"),
+            &format!("{url}/token"),
+            &MemStore::default(),
+            "me@gmx.de",
+            Credential::Passkey(&sign),
+        );
+        assert!(matches!(err, Err(Error::PasskeyNotOffered)));
+    }
+
+    #[test]
+    fn a_flow_without_a_password_step_stops_before_sending_it() {
+        let mut s = Server::new();
+        browser_pages(&mut s);
+        s.mock("POST", "/rest/login-flow/identification")
+            .with_body(
+                json!({"sessionId": "sess", "nextStep": [{"type": "CAPTCHA_SLIDE"}]}).to_string(),
+            )
+            .create();
+        let password = s
+            .mock("POST", "/rest/login-flow/authentication/password")
+            .expect(0)
+            .create();
+        let err = run(&s, &MemStore::default()).unwrap_err();
+        password.assert();
+        assert!(
+            matches!(err, Error::LoginIncomplete { ref flow_state } if flow_state == "CAPTCHA_SLIDE"),
             "{err}"
         );
     }

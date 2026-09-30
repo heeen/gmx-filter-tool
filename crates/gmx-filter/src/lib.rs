@@ -3,6 +3,8 @@ mod error;
 mod lint;
 mod login;
 mod model;
+#[cfg(feature = "passkey")]
+mod passkey;
 mod plan;
 mod rulefile;
 mod session;
@@ -18,6 +20,8 @@ pub use lint::{Diagnostic, Severity, check, has_errors};
 pub use model::*;
 pub use plan::{Op, Plan};
 pub use rulefile::{DesiredRule, export, parse, rule_notes};
+#[cfg(feature = "passkey")]
+pub use session::login_with_passkey;
 pub use session::{login, logout, password_from_command, stored_token_source};
 pub use sieve::{SieveImport, export_sieve, parse_sieve};
 pub use simplify::{Simplified, simplify};

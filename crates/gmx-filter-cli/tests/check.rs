@@ -8,8 +8,11 @@ when = [{ from.contains = "newsletter" }, { subject.starts-with = "[news]" }]
 then = [{ move = "INBOX/Newsletter" }]
 "#;
 
+/// A temp file named `…-{name}`, unique per call: tests run in parallel in one process.
 fn scratch(name: &str, body: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("gmxf-check-{}-{name}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("gmxf-check-{}-{n}-{name}", std::process::id()));
     fs::write(&path, body).unwrap();
     path
 }
