@@ -6,8 +6,11 @@ with a dry run, instead of clicking through the web settings.
 
 ```console
 $ gmxf list
-5                                      on  club-2   if from Contains "wiki@club-koeln.example" -> move INBOX/Club Köln, stop
-2                                      off chatter  if from Contains "@chatter.example" -> move INBOX/chatter, stop
+ID        NAME        ENABLED  RULE
+1         newsletter  yes      from contains ["news@", "promotion", "noreply@video.example", +5 more] -> move INBOX/Newsletter, stop
+5         club        yes      from contains "wiki@club-koeln.example" or to contains ["members@club-koeln.example", "board@club-koeln.example"] -> move INBOX/Club Köln, stop
+2         chatter     no       from contains "@chatter.example" -> move INBOX/chatter, stop
+b1e2c3d4  firmware    yes      subject contains "FirmwareUpdates" -> move INBOX/Firmware
 $ gmxf extend newsletter news@shop.example        # add a sender to an existing rule
 $ gmxf edit newsletter                            # or edit it in $EDITOR, crontab -e style
 ```
@@ -107,14 +110,16 @@ Details and open questions: [docs/sieve.md](docs/sieve.md).
 
 | command | |
 |---|---|
-| `gmxf list` | rules with their conditions and actions |
+| `gmxf list` | rules with their conditions and actions; long lists shortened to `+N more`, long ids to 8 characters (`--long` shows everything) |
 | `gmxf folders` | folder names usable in `move` / `copy` |
 | `gmxf add NAME --when "from contains x@y.de" --then "move INBOX/X"` | create a rule (`--all`, `--no-stop`) |
 | `gmxf extend RULE VALUE…` | add `from contains VALUE` conditions to an "any" rule (`--field`, `--when`, `--dry-run`) |
-| `gmxf rename ID NAME` | rename a rule |
-| `gmxf move ID POSITION` | move a rule to a 1-based position |
-| `gmxf enable ID` / `disable ID` / `delete ID` | |
+| `gmxf rename RULE NAME` | rename a rule |
+| `gmxf move RULE POSITION` | move a rule to a 1-based position |
+| `gmxf enable RULE` / `disable RULE` / `delete RULE` | |
 | `gmxf export --raw` | the rules as the API's JSON, as a backup |
+
+`RULE` is an id, any unambiguous start of one (as `gmxf list` shows it), or a rule name.
 
 ## Things to know
 
