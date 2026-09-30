@@ -111,6 +111,12 @@ only knows the types listed here, whatever the backend behind it may support. Th
 writes `operator: "AND"`, inverted groups with several entries, or inverted entries; the server accepts
 and returns them unchanged.
 
+The web UI cannot represent such groups ✔ (tested 2026-09-30): it shows every entry of every group as its own
+row under the rule's "alle"/"eine" mode, ignoring `operator`. Saving the rule in the UI rewrites it into that
+flat form (one single-entry `OR` group per row), which changes its meaning whenever a group combines its
+entries differently from the rule: `AllOf [ Subject OR [YYY, WWW] ]` came back as `AllOf [ Subject YYY,
+Subject WWW ]`, i.e. both required. Nothing in the UI warns about this.
+
 ### Actions
 
 Executed in array order.
