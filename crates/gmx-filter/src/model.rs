@@ -86,7 +86,11 @@ pub enum KnownCondition {
     AllOf {
         conditions: Vec<Condition>,
     },
+    /// Written as `AllNewEmails` (like the web UI); the server stores and returns it as `NewMail`
+    /// without `inverted`, dropping a `true` silently.
+    #[serde(alias = "NewMail")]
     AllNewEmails {
+        #[serde(default)]
         inverted: bool,
     },
     #[serde(rename_all = "camelCase")]
@@ -249,5 +253,18 @@ mod tests {
             panic!("not AnyOf");
         };
         assert_eq!(conditions.len(), 1);
+    }
+
+    #[test]
+    fn the_servers_new_mail_is_all_new_emails() {
+        let c: Condition = serde_json::from_value(json!({"type": "NewMail"})).unwrap();
+        assert_eq!(
+            c,
+            Condition::Known(KnownCondition::AllNewEmails { inverted: false })
+        );
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            json!({"type": "AllNewEmails", "inverted": false})
+        );
     }
 }

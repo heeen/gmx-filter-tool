@@ -87,6 +87,14 @@ Reorder: `PUT /filterRules` with `{"rules": [full rules in the new order]}` -> 2
 Calls need `X-UI-App: gmxnet.mailset-organize-inbox/1.0.7-build.195` and a browser `User-Agent` (POST
 without it: 400 `request.httpUserAgent: rejected value [null]`).
 
+Probed live with inactive throwaway rules (2026-09-30):
+- `AnyOf`/`AllOf` nested in each other (any depth, any mix): **400, empty body**. One level only.
+- `Multi*` groups with `operator: "AND"`, with outer `inverted: true` (OR and AND), and header conditions
+  with inner `inverted: true`: accepted and returned unchanged. `AnyOf` with a single child: unchanged.
+- `AllNewEmails` (what the web UI writes) is stored and returned as `{"type": "NewMail"}`, without
+  `inverted`; `inverted: true` is dropped silently (the rule then matches all mail). An `inverted` field on
+  `AnyOf` is dropped silently too.
+
 ### Folders (`settings-cats`)
 
 `GET https://settings-cats.gmx.net/mailbox/primary/folder?absoluteURI=false` needs `Accept` **and**
