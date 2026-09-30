@@ -444,10 +444,7 @@ mod tests {
         let text = b.join("\n");
         let middle = plan(&remote, &text, false).unwrap();
         assert_eq!(kinds(&middle), ["create", "reorder"]);
-        assert_eq!(
-            order_names(&middle)[..3],
-            ["club-2", "new", "club köln"]
-        );
+        assert_eq!(order_names(&middle)[..3], ["club-2", "new", "club köln"]);
         assert!(matches!(&middle.ops[1], Op::Reorder { order } if order[1].0.is_none()));
     }
 
