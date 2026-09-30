@@ -5,6 +5,11 @@ GMX; everything here comes from browser traces, the public JavaScript of the web
 real account with inactive throwaway rules. Marks: **✔** sent and verified live, **◇** read back from the
 server or seen in the web app's code, never sent by gmxf.
 
+There is no machine-readable description: with a valid token, settings-bff (Spring Boot) answers 404
+`no-resource-found` for `/v3/api-docs`, `/v2/api-docs`, `/openapi.*`, `/swagger-ui*`, `/actuator/**`, `/`,
+and settings-cats answers 403 for everything outside its allowlist, including guesses at the backend's
+rule and setting resources (probed 2026-09-30). Without a token both answer 401 to every path.
+
 `settings-bff.gmx.net` is a thin proxy: the `uri` of a rule points at GMX's internal mail backend
 ("Trinity", `…/rest/MailAccount/<account>/Rule/User/<id>`).
 
