@@ -47,6 +47,8 @@ Either way the `gmxf` binary ends up in `~/.cargo/bin`, which rustup puts on you
 - To remove it: `cargo uninstall gmx-filter-cli`, plus `~/.config/gmxf` and `~/.local/state/gmxf` if you
   want its settings and session gone.
 - Without installing: `cargo build --release` puts the binary at `target/release/gmxf`.
+- Passkey login (`gmxf login --passkey`, below) is an optional feature, because it pulls in a Bluetooth
+  stack: add `--features passkey` to either install command.
 
 ## Log in
 
@@ -59,10 +61,15 @@ gmxf login
   (`pass`, `secret-tool lookup …` or a `gpg -d` pipe work just as well). With it set, gmxf renews an expired
   session by itself; without it, `gmxf login` prompts, and you log in again when the session expires.
 - `gmxf login --password-stdin` reads the password from stdin instead.
+- `gmxf login --passkey` logs in with a passkey on your phone, like Chrome's "use a phone" option: scan the
+  QR code in the terminal and approve on the phone (e.g. in Bitwarden). It needs Bluetooth on this computer
+  and the phone nearby, and a build with the `passkey` feature. The passkey stays on the phone; gmxf only
+  gets the signed answer, as a browser would. An expired session is still renewed with `password_cmd`, if
+  set; otherwise run `gmxf login --passkey` again.
 - The settings live in `~/.config/gmxf/config.toml`; `gmxf config` shows them.
 - The webmail session (cookies) is stored in `~/.local/state/gmxf/session`, readable only by you. Your
   password is never stored by gmxf. `gmxf logout` removes the session.
-- Accounts that need a captcha or second factor at login are not supported; gmxf reports that and stops.
+- Logins that ask for a captcha or a second factor are not supported; gmxf reports that and stops.
 - `--token-cmd` / `GMXF_TOKEN_CMD` bypasses all of this with a bearer token you provide.
 
 ## Rules file

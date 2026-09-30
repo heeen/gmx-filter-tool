@@ -199,6 +199,26 @@ Answer `200 { "access_token": STRING, "token_type": "Bearer", "expires_in": 7200
 Missing client authentication: `401 invalid_client`; missing `userAgentB64`: `400 invalid_request`; an
 expired session: 400/401/403. The login that produces the session cookies is described in `re/NOTES.md`.
 
+### Passkey login ✔
+
+The login page's JSON flow (`https://login.gmx.net/rest/login-flow`, headers as for the password step; the
+full login is in `re/NOTES.md`) offers passkeys next to the password:
+
+1. `POST /identification` answers `nextStep: [{"type": "PASSWORD"}, {"type": "WEBAUTHN_START"}]`.
+2. `POST /authentication/webauthn-start {"sessionId"}` answers
+   `nextStep: [{"type": "PASSWORD"}, {"type": "WEBAUTHN_FINISH", "optionsJson": STRING}]`, where
+   `optionsJson` is `{"publicKey": {challenge, rpId, timeout, userVerification, allowCredentials?}}` (base64url).
+3. The browser runs `navigator.credentials.get` with it (origin `https://auth.gmx.net`).
+4. `POST /authentication/webauthn-finish {"sessionId", "factorValue": STRING}` with `factorValue` the
+   `PublicKeyCredential.toJSON()` string: `{id, rawId, type, response: {authenticatorData, clientDataJSON,
+   signature, userHandle}, authenticatorAttachment, clientExtensionResults}`, all binaries base64url without
+   padding. Success: `{"flowState": "SUCCESS", "redirectUrl"}`, continued as after a password. Rejected:
+   `{"flowState": "ONGOING", "stepSuccess": false, "nextStep": [...]}`.
+
+The server checks `clientDataJSON` exactly: an origin of `https://auth.gmx.net/` (trailing slash, as
+`url::Url` prints it) is rejected; `{"type":"webauthn.get","challenge":…,"origin":"https://auth.gmx.net",
+"crossOrigin":false}` is accepted.
+
 ## Errors
 
 Mostly RFC 7807 problem objects:
